@@ -1,0 +1,483 @@
+NOVOAPEX TS -> GO MIGRATION TODO
+================================
+Source of truth for scope/detail: MIGRATION_PLAN.md (same repo).
+Decisions recorded in: docs/adr/0001-queue-substrate.md, docs/adr/0002-orchestrator-language.md.
+Track by flipping [ ] to [x]. Task IDs map to MIGRATION_PLAN.md; lettered sub-items (a,b,c...)
+are atomic splits introduced for tracking and do not exist in the plan.
+
+LEGEND: [ ] open  [x] done  [~] partially done / blocked (note inline)
+
+========================================================================
+DONE — DECISIONS RECORDED 2026-08-21
+========================================================================
+
+[x] A.1  Queue mechanics: drain-and-cut per queue; Postgres bridge for webhook-processing only; substrate = asynq (ADR 0001)
+[x] A.2  Full port — nothing remains in Node, incl. orchestrator; Stage 8a demoted to measurement gate (ADR 0002)
+[x] Repo layout: separate Go repo novoapex_backend_api scaffolded (C.2 layout, go.mod, lint config, CI, sqlc.yaml, schema sync script)
+[x] Inventory fix: plan corrected 16 -> 14 prisma migrations
+
+========================================================================
+OPEN DECISIONS & ENV SETUP (do first, cheap)
+========================================================================
+
+[x] S.1   brew install sqlc golangci-lint (local tooling)
+[ ] S.2   Verify Go repo CI is green on first push (build/vet/test/lint workflow untested)
+[ ] A.3a  Confirm: Prisma stays migration source of truth until Stage 9; sqlc reads live schema
+[ ] A.3b  Confirm: no schema changes during any cutover window
+[ ] A.4a  Confirm real production topology = 2 containers (api incl. mobile API + worker), staging and prod
+[ ] A.4b  Confirm apps/mobile-api standalone entrypoint is dev-only / can be dropped
+[ ] A.4c  Approve path-based routing in Caddy as the cutover mechanism
+[ ] F.4b  Who does this work, full-time? Competing roadmap?
+[ ] F.4c  Are mobile clients version-pinned to the API contract?
+[ ] F.4d  Do recorded production webhook payloads / transcripts exist for replay? (prereq for T0.5 corpus if not)
+[ ] F.4e  Is apps/mobile-api standalone deployed anywhere, or dead code?
+[ ] F.4f  Decide: should unset WHATSAPP_APP_SECRET become fail-closed in prod (do NOT change silently during port)
+
+========================================================================
+STAGE 0 — FOUNDATIONS AND CHARACTERIZATION HARNESS
+Exit gate: T0.6-T0.17 pass against Node stack in CI; Go module builds/lints/connects;
+config + log parity tests pass. No Go app code ships this stage.
+========================================================================
+
+-- Test harness --
+[x] T0.1a  Add testcontainers-go dependency + reusable test bootstrap helper
+[x] T0.1b  pgvector/pgvector:pg15 container fixture (matches docker-compose.yml)
+[x] T0.1c  redis:7-alpine container fixture (matches docker-compose.yml)
+[x] T0.2a  Run `prisma migrate deploy` against container in test setup (needs node+npm or bundled CLI)
+[x] T0.2b  Assert all 14 migrations apply cleanly from empty database
+[x] T0.3a  Fixture factory: business
+[x] T0.3b  Fixture factory: customer + profile
+[x] T0.3c  Fixture factory: conversation
+[x] T0.3d  Fixture factory: products w/ images + 768-dim embeddings
+[x] T0.3e  Fixture factory: FAQ
+[x] T0.4   Golden-file diff helper for JSON response comparison
+[x] T0.5a  Request/response recorder for staging traffic (paths, headers, bodies, status) -> replayable corpus
+[x] T0.5b  PII scrubbing applied BEFORE recorder writes to disk
+[x] T0.5c  Corpus loader for replay in later stages (T2.8, T5.18)
+
+-- Characterization tests vs NODE stack (oracle for everything later) --
+[x] T0.6a  E2E happy path: webhook -> WebhookEvent + InboundMessage rows
+[x] T0.6b  E2E happy path: orchestrator runs, LLM stubbed at HTTP layer (NOT mocked in Nest)
+           (note: @ai-sdk/openai v3 routes generateObject via POST /v1/responses, not chat/completions)
+[x] T0.6c  E2E happy path: Order + OrderItem created
+           (found + fixed env issue: stale dist/ bundle predated the text=uuid stock fix — REBUILT Aug 21; verify prod image is post-Aug-18!)
+[x] T0.6d  E2E happy path: payment link enqueued to outbound-queue
+           (state machine requires LEAD->BROWSING->INVOICING; LEAD->INVOICING rejected)
+[x] T0.7a  Stock decrement: multi-item order
+[x] T0.7b  Stock decrement: duplicate line-items for one product
+           (N ledger rows kept verbatim 1+2, ONE aggregate decrement of 3; total aggregated)
+[x] T0.7c  Stock decrement: insufficient stock rollback
+           (full tx rollback, no order row, stock intact, job COMPLETES — error swallowed; conversation stays INVOICING)
+[x] T0.7d  Stock decrement: concurrent orders racing same product
+           (pg row-lock serializes txs; loser re-checks committed stock; exactly 1 order survives)
+[x] T0.8   Order idempotency: same sourceMessageId twice -> exactly one Order
+           (unique index backstop proven at schema level; handler P2002-retry path covered by T7.14)
+[x] T0.9   Webhook idempotency: same idempotencyKey twice -> one InboundMessage
+           (full stack: containers -> Node api+worker -> signed webhook POST -> worker processed BullMQ job; also proves WebhookEvent row)
+[x] T0.10a Money: Decimal(14,2) totals
+[x] T0.10b Money: averageOrderValue rounding (51.01/2 -> stored 25.51 via DECIMAL(14,2) storage rounding)
+[x] T0.10c Money: totalSpent accumulation
+[x] T0.10d Money: Paystack major<->minor conversion both directions
+           (initiate sends MINOR 5100 for 51.00; Payment rows store MAJOR 51.00; payout transfers minor too)
+[x] T0.11a Reconciliation Strategy A: match by reference = order id (+ amount must be Decimal-equal) -> order PAID,
+           cancels scheduled follow-ups, confirmation outbound created
+[x] T0.11b Reconciliation Strategy B: fallback phone + amount (scoped by metadata.businessId, candidates CONFIRMED/
+           PAYMENT_PENDING top-5; AMBIGUOUS >1 candidates -> abandoned entirely, NO payment row)
+[ ] T0.11c Reconciliation: ambiguous-match case behavior
+[x] T0.12a Conversation state machine: every legal transition in VALID_TRANSITIONS
+           (17-row table test on one stack; 7 legal edges driven via intents; 4 table-legal edges UNREACHABLE
+            via pipeline because intent source-guards are stricter than the table — CHECKOUT/INVOICING->SUPPORT etc.;
+            X->ESCALATED only via human actions in mobile-api, never the worker; low-confidence <0.7 sets
+            isEscalatedToHuman flag ONLY, it is NOT a state-machine edge; SUPPORT->LEAD has no emitting code path)
+[x] T0.12b Conversation state machine: illegal transitions rejected
+           (dual gatekeepers: orchestrator AND order-ledger handler both reject e.g. LEAD/SUPPORT->INVOICING)
+[~] T0.12c Conversation state machine: CAS stale-write rejection (black-box trigger not reachable via HTTP pipeline; full CAS validation lands with T7.29 port)
+[x] T0.13a Image rules: unsolicited image suppressed (ids ignored when customer_requested_images=false)
+[x] T0.13b Image rules: image sent on explicit request (outbound row w/ image_url + product_id + caption "<name> - GHS 25.50")
+[ ] T0.13c Image rules: already-seen image not re-attached on quantity turn
+[ ] T0.13d Image rules: re-sent when asked again
+[x] T0.14  24h window: free-form send blocked outside window; row status=failed_24h_window_closed
+           (row IS written w/ raw_payload={} but never enqueued; gate reads newest inbound_messages.timestamp, NOT last_contact_at)
+[x] T0.15a Payment copy: per-currency paymentMethods string appears in invoice message
+           (GHS = "Mobile Money, card, or bank transfer")
+[x] T0.15b Payment copy: processor brand name never appears in PROSE (checkout URL host legitimately contains it)
+[x] T0.16  Payout balance arithmetic + requestPayout guards
+           (balance = SUCCESS revenue - SUCCESS+PENDING payouts floored at 0; DTO has no min/max, guards are zod positive();
+           transferrecipient code cached on businesses.paystack_recipient_code)
+[x] T0.17  Multi-tenancy: cross-tenant access with valid other-business token -> 403/404 on every read endpoint
+           (full email-OTP -> JWT -> create-business flow via SMTP stub; cross-tenant 404 verified)
+[x] T0.18  Harness wired into novoapex CI as REQUIRED check
+           (.github/workflows/characterization.yml: dual checkout, npm ci + build:all, go lint + all three packages;
+            NOVOAPEX_REPO env pinned to workspace path — override branch verified locally.
+            TODO-human: mark job "characterization" required in branch protection; cross-repo checkout needs repo to exist
+            on GitHub under novoapex org, PAT/org token if private) on Node stack
+
+-- Go foundations --
+[x] T0.19  Standalone Go repo created: layout agreed (C.2), go.mod (github.com/novoapex/novoapex-backend-api)
+[x] T0.20  .golangci.yml with errcheck/govet/staticcheck/ineffassign/bodyclose/rowserrcheck/sqlclosecheck
+[~] T0.21  GitHub Actions build/vet/test/lint workflow written (untested until first push — see S.2)
+[x] T0.22  sqlc: sync script vendoring prisma migrations [x]; sqlc.yaml pgx/v5 + decimal overrides [x];
+           generate models for all 15 tables + 3 enums [x] (sqlc auto-typed vector cols as pgvector.Vector)
+[ ] T0.22b Wire harness tests into Go repo CI (checkout novoapex + setup-node so npx prisma migrate deploy works)
+[x] T0.23  Verify sqlc + pgvector-go round-trips 768-dim vector without precision loss
+           (bit-exact float32 equality on readback + 767-dim insert rejected by vector(768))
+[x] T0.24a Verify sqlc maps NUMERIC(14,2) -> shopspring/decimal, no float path anywhere
+           (verified in generated models.go: 6 money columns on decimal.Decimal, zero float32/float64)
+[x] T0.24b Test asserting 0.1+0.2-style float errors are impossible in money package
+           (internal/money: decimal-only constructors, minor-unit round trips, JSON-number contract pinned)
+[x] T0.25a Port config.schema.ts: struct with all 30+ env vars
+[x] T0.25b Config defaults identical to Node
+[x] T0.25c Validation: JWT_SECRET >=32 chars fails startup, etc.
+[x] T0.25d REDIS_TLS string-or-bool coercion
+[x] T0.25e DATABASE_POOL_* tuning knobs
+[x] T0.25f Resolve ENABLE_SWAGGER omission (declare in Go or document)
+[x] T0.26  Table-test config parity Go vs Node across set/unset/invalid inputs
+           (123 cases: 120 exact agreements + 3 encoded divergences [fractional unconstrained numbers] + 0 new;
+            mutation-verified; empty-string-vs-unset nuances documented)
+[x] T0.27  Port instrument.ts: Sentry init, SENTRY_SEND_PII default false, PII scrubbing
+           (key set senderPhone/recipientPhone/customerPhone/ownerPhone/phone/conversationId -> "[redacted]";
+            depth cap 6; hooks gate on SENTRY_SEND_PII!="true"; DSN-empty = no-op init)
+[x] T0.28  log/slog JSON handler, field names match pino exactly
+           (PLAN CORRECTION: pino contract is level=NUMBER 10..60, time=epoch-ms number, msg/pid/hostname/context —
+            there is NO "event" key convention in the Node source; pretty transport is dev-only;
+            prod redacts only req.headers.authorization/cookie)
+[~] T0.29  Throwaway Go logging container; Grafana dashboards + Loki queries still render/parse
+           (Loki 3.4.2 round-trip proven w/ promtail's real labels from docker/promtail/promtail-config.yml;
+            TWO LIVE BUGS FOUND in current stack: dashboard queries service="novoapex-api" but promtail assigns "api";
+            promtail parses RFC3339Nano but pino emits epoch-ms -> timestamps silently fall back to ingest time.
+            HUMAN STEP: verify rendering in staging Grafana after fixing label/timestamp stages)
+[x] T0.30  Prometheus registry ported; metric names match so dashboards/alerts survive
+           (Node serves ZERO custom app metrics - only prom-client defaults; golden parity diff at testdata/golden/
+            metric_parity.json documents shared/gap families; KnownGaps includes dashboard-referenced
+            http_request_duration_seconds served by NEITHER stack)
+
+========================================================================
+STAGE 1 — GO SKELETON AND INGRESS SPLIT
+Precondition: Stage 0 exit gate. Rollback: revert Caddy path block.
+========================================================================
+
+[ ] T1.1   cmd/api on chi, graceful shutdown matching enableShutdownHooks(), default port 3100
+[ ] T1.2   pgx pool honoring DATABASE_POOL_MAX / IDLE_TIMEOUT_MS / CONNECTION_TIMEOUT_MS
+[ ] T1.3   Redis client honoring REDIS_TLS + Upstash host heuristic from queue-producer.module.ts
+[ ] T1.4   Health endpoints /health /health/live /health/ready — same bodies/status codes as Terminus
+[ ] T1.5   Error envelope from AllExceptionsFilter + SentryFilter — identical JSON shape/status/Sentry behavior
+[ ] T1.6   go-api service in docker-compose.yml: healthcheck, depends_on, env wiring same as api
+[ ] T1.7a  Caddyfile catch-all -> explicit path routing, committed as NO-OP (everything still to node-api)
+[ ] T1.7b  Only /health/go routed to go-api; routing mechanism proven
+[ ] T1.8   deployment/deploy.sh builds and rolls Go container
+[ ] T1.9   Documented one-command rollback (revert Caddy path block + reload); rehearsed once
+[ ] T1.10  Multi-stage Dockerfile.go -> static binary on distroless/alpine; record image size + cold-start baseline
+[ ] T1.11  Deliberate Go error visible in Sentry, correctly scrubbed
+[ ] T1.12  Prometheus scrapes Go service; Grafana renders it
+[ ] T1.13  Load-test skeleton; record throughput/latency baseline (T8.1 compares against this)
+
+========================================================================
+STAGE 2 — READ-ONLY VENDOR API (19 GETs)
+Rollback: revert Caddy blocks per module; no writes involved.
+========================================================================
+
+-- Shared plumbing --
+[ ] T2.1   JWT validation middleware compatible with jwt.strategy.ts (same secret/alg, claims {phone,businessId})
+[ ] T2.2   Default-deny auth (JwtAuthGuard equivalent) + @Public() opt-out
+[ ] T2.3   CurrentUser request-context helper
+[ ] T2.4   PaginationDto semantics: page dflt 1 min 1; limit dflt 20 min 1 max 100; string coercion
+[ ] T2.5   PaginatedResponse<T> envelope exact (field names, total/page metadata)
+[ ] T2.6   Decimal serialization as JSON NUMBER (DecimalSerializerInterceptor contract) + per-endpoint money tests
+[ ] T2.7   ZodValidationPipe error shape for query validation failures
+[ ] T2.8   Response-parity harness: replay T0.5 corpus vs both stacks, structural JSON diff (arrays sensitive)
+
+-- Endpoints (handler + service method + parity test + businessId scoping each) --
+[ ] T2.9   GET /
+[ ] T2.10  GET /customers
+[ ] T2.11  GET /customers/summary
+[ ] T2.12  GET /customers/:id (404 semantics)
+[ ] T2.13  GET /products (incl images)
+[ ] T2.14  GET /products/metrics
+[ ] T2.15  GET /products/:id
+[ ] T2.16  GET /orders (incl items)
+[ ] T2.17  GET /orders/summary
+[ ] T2.18  GET /orders/:id
+[ ] T2.19  GET /inbox/summary
+[ ] T2.20  GET /inbox/handoffs
+[ ] T2.21  GET /conversations/:id/messages (merge inbound+outbound, time sort, limit 50)
+[ ] T2.22  GET /dashboard/summary
+[ ] T2.23  GET /analytics/overview
+[ ] T2.24  GET /analytics/handoff-reasons
+[ ] T2.25  GET /analytics/demand
+[ ] T2.26  GET /payouts/balance (depends RevenueService.getTotalRevenue)
+[ ] T2.27  GET /payouts/history
+[ ] T2.28a RevenueService.getTotalRevenue
+[ ] T2.28b RevenueService.getPipelineValue
+[ ] T2.28c RevenueService.getRevenueByPeriod
+[ ] T2.28d RevenueService.getTopProducts
+[ ] T2.28e RevenueService.getPaymentsByStatus
+(validate T2.28 against T0.10/T0.16 — money critical)
+
+-- Cutover --
+[ ] T2.29  Re-run T0.17 tenant isolation against Go
+[ ] T2.30  Date/time serialisation parity (ISO-8601, timezone, precision)
+[ ] T2.31  null-vs-omitted-field parity for every nullable column
+[ ] T2.32  Shift read paths in Caddy module-by-module: customers -> products -> orders -> inbox -> analytics -> payouts
+[ ] T2.33  Soak one week; compare error rate, p50/p99, Sentry volume vs baseline
+
+========================================================================
+STAGE 3 — AUTHENTICATION
+Rollback: revert Caddy block; tokens valid on both stacks by construction.
+========================================================================
+
+[ ] T3.1   OtpService.generateOtp: code length, charset, Redis key format
+[ ] T3.2   OtpService.verifyOtp: TTL 5min, single-use, failure counting
+[ ] T3.3   Cross-validation: OTP issued by Node verifies in Go and vice versa
+[ ] T3.4   WhatsApp OTP delivery (sendTextMessage)
+[ ] T3.5   Email OTP delivery (SMTP/Zoho, port 465 TLS)
+[ ] T3.6   POST /auth/request-otp incl deliveryMethod branch + delivery-failure error wrapping
+[ ] T3.7   POST /auth/verify-otp: token minting, isNewUser derivation, business payload
+[ ] T3.8   GET /auth/me
+[ ] T3.9   Cross-validation: Node-minted JWT validates in Go AND Go-minted validates in Node (claims/exp/alg)
+[ ] T3.10  Throttling on request-otp + trust-proxy so limits key off real client IP behind Caddy
+[ ] T3.11  JWT_SECRET length validation fails Go startup like Node
+[ ] T3.12  Auth-failure-rate alert BEFORE cutover
+[ ] T3.13  Cut /auth/* to Go; monitor 48h
+
+========================================================================
+STAGE 4 — VENDOR API WRITES + IMAGE PIPELINE
+Rollback: revert Caddy blocks; writes persist — safe only because no schema change ships (A.3b).
+========================================================================
+
+[ ] T4.1   Decide + record how embedding enqueue works during this stage (bridge vs defer to Stage 6)
+[ ] T4.2a  DTO validation + zod error shape: CreateBusinessDto
+[ ] T4.2b  DTO: CreateProductDto
+[ ] T4.2c  DTO: UpdateProductDto
+[ ] T4.2d  DTO: ReorderImagesDto
+[ ] T4.2e  DTO: ReplyDto
+[ ] T4.2f  DTO: UpdateOrderDto
+[ ] T4.2g  DTO: RequestPayoutDto
+[ ] T4.2h  DTO: RequestOtpDto
+[ ] T4.2i  DTO: VerifyOtpDto
+[ ] T4.3   POST /businesses (owner-phone binding)
+[ ] T4.4   POST /products (+embedding enqueue per T4.1)
+[ ] T4.5   PATCH /products/:id (re-embed on name/description change)
+[ ] T4.6   DELETE /products/:id (cascade + best-effort Cloudinary delete)
+[ ] T4.7   POST /products/:id/out-of-stock
+[ ] T4.8   StorageProvider interface + factory
+[ ] T4.9   Cloudinary provider: uploadImage (folder novoapex), deleteImage
+[ ] T4.10  Multipart handling, same count/size limits as today
+[ ] T4.11  POST /products/:id/image (single) + /images (multi), max 5/product
+[ ] T4.12  SHA-256 content-hash dedup (@@unique productId+contentHash; NULL-distinct for legacy rows)
+[ ] T4.13  DELETE image: position re-densification + non-blocking asset-delete failure
+[ ] T4.14  PUT reorder: dense position invariant under @@unique(productId,position), two-phase/deferred constraint
+[ ] T4.15  Image-embedding enqueue on upload
+[ ] T4.16  PATCH /orders/:id/fulfillment (valid status set)
+[ ] T4.17  POST /orders/:id/escalate
+[ ] T4.18  POST /conversations/:id/takeover (isEscalatedToHuman)
+[ ] T4.19  POST /conversations/:id/release
+[ ] T4.20  POST /conversations/:id/reply (24h window rule; OutboundMessage + enqueue per T4.1)
+[ ] T4.21  POST /payouts/request: createTransferRecipient caching (paystackRecipientCode) + initiateTransfer — MONEY PATH, validate vs T0.16
+[ ] T4.22  OpenAPI/Swagger generation for vendor surface
+[ ] T4.23a Concurrency: simultaneous image reorder
+[ ] T4.23b Concurrency: simultaneous payout request
+[ ] T4.23c Concurrency: simultaneous product update
+[ ] T4.24  Cut remaining vendor paths to Go, module by module
+[ ] T4.25  Soak one week
+
+========================================================================
+STAGE 5 — WEBHOOK INGEST, PAYMENTS, MESSAGES (highest consequence so far)
+Rollback: revert Caddy block; bridged jobs must drain first — rehearse drain procedure.
+========================================================================
+
+-- WhatsApp ingest --
+[ ] T5.1   GET /webhooks/whatsapp hub.challenge verification (raw challenge, correct content type)
+[ ] T5.2   Raw-body capture middleware; router must not consume body before signature check (fails open otherwise)
+[ ] T5.3   X-Hub-Signature-256 HMAC-SHA256, constant-time compare + length check (whatsapp.controller.ts:59-74)
+[ ] T5.4   Preserve unset-WHATSAPP_APP_SECRET warn-and-skip behavior (F.4f decides fail-closed separately)
+[ ] T5.5   Payload walk entry[]->changes[]->value.messages[], metadata.phone_number_id -> recipientPhone
+[ ] T5.6   object !== whatsapp_business_account early return
+[ ] T5.7   Idempotency key derivation + enqueue via bridge (Go writes rows in tx; Node shim enqueues to BullMQ)
+[ ] T5.8   @SkipThrottle() behavior preserved (Meta bursts from few IPs)
+[ ] T5.9   Referral capture logging (source_type/source_id/source_url/headline)
+[ ] T5.10a Signature rejection test: tampered body
+[ ] T5.10b Signature rejection test: missing header
+[ ] T5.10c Signature rejection test: wrong secret
+[ ] T5.10d Signature rejection test: truncated signature
+[ ] T5.10e Signature rejection test: valid signature over different body
+
+-- Payments ingest --
+[ ] T5.11  POST /webhooks/payments/:provider with raw-body handling
+[ ] T5.12  Paystack verifyWebhookSignature: HMAC-SHA512 raw body, x-paystack-signature, constant-time
+[ ] T5.13  parseWebhookEvent -> NormalisedPaymentEvent (minor->major, businessId from metadata, paidAt)
+[ ] T5.14  PaymentProviderFactory as Go interface + registry (getProvider/getDefault/getAvailable)
+[ ] T5.15  initiatePayment (minor units, callback URL, metadata businessId, authorization_url)
+[ ] T5.16  createTransferRecipient + initiateTransfer
+[ ] T5.17  Enqueue payment-events via A.1 mechanism
+[ ] T5.18  Replay captured Paystack webhook corpus vs both stacks; diff DB state
+
+-- Messages and admin --
+[ ] T5.19a WhatsAppService.sendTextMessage
+[ ] T5.19b WhatsAppService.sendTemplateMessage
+[ ] T5.19c WhatsAppService.sendImageMessage
+[ ] T5.19d Shared sendMessage HTTP path
+[ ] T5.19e extractMessageId
+[ ] T5.20  POST /messages/send/text + /messages/send/template
+[ ] T5.21  Retire /admin/queues Bull-Board when queue substrate moves; asynqmon replacement + basic auth
+[ ] T5.22  Cut /webhooks/* and /messages/* to Go
+[ ] T5.23  Watch 24h with webhook error-rate alert before proceeding
+
+========================================================================
+STAGE 6 — QUEUE SUBSTRATE + EMBEDDING WORKER
+outbound-queue deferred to Stage 8c (its producers span Stages 7-8). Rollback: per queue,
+re-point producer at BullMQ; Node worker stays deployable through this stage and Stage 7.
+========================================================================
+
+[ ] T6.1   Per-queue drain runbook (pause producer -> confirm drained -> deploy both sides -> resume); rehearsed staging
+[ ] T6.2   asynq runtime: Redis conn, worker mux, cmd/worker graceful shutdown
+[ ] T6.3   Map job options per queue (B.2 table): MaxRetry, exp backoff, retention, rate limiter middleware
+           (100/10s webhook, 50/1s outbound+CRM, 20/1s payments, 10/1s follow-up)
+[ ] T6.4   EXPLICIT failure-event registration + test that failure handler actually fires (Nest @OnQueueEvent lesson)
+[ ] T6.5   Permanent-failure path: fatal log w/ real stack -> Sentry once retries exhausted
+[ ] T6.6   Per-stage error context helper (runStage equivalent from crm-materialiser.processor.ts)
+[ ] T6.7   recover() safety nets in worker goroutines (unhandledRejection/uncaughtException equivalents)
+[ ] T6.8   go-worker in docker-compose.yml + deploy script
+[ ] T6.9   asynqmon up w/ basic auth (replaces Bull-Board, per T5.21)
+-- embedding --
+[ ] T6.15  EmbeddingService.buildSearchDocument — IDENTICAL text assembly (changes alter every vector silently)
+[ ] T6.16  generateEmbedding: text-embedding-3-small @ 768 dims, dimension-reduction param passed identically
+[ ] T6.17  embedProduct + raw-SQL vector write
+[ ] T6.18  embedAllForBusiness bulk path + partial-failure reporting
+[ ] T6.19  ImageEmbeddingService: generateImageEmbedding(+FromUrl), embedProductImageRow(s), findSimilarProductsByImage
+[ ] T6.20  embedding.processor job-name switch (embed-product, embed-product-image) + unknown-type error
+[ ] T6.21  Vector PARITY test: same corpus through both stacks, vectors match full precision
+[ ] T6.22  Retrieval quality: fixed queries through semanticProductSearch both stacks, ranked results compared
+[ ] T6.23  Drain-and-cut embedding; retire T4.1 bridge if used
+
+========================================================================
+STAGE 7 — BUSINESS-LOGIC WORKERS AND CRONS (highest financial risk)
+outbound-queue STAYS on BullMQ all stage (Node worker keeps consuming). Rollback per queue;
+payment errors NOT route-revertible — document + rehearse manual reconciliation.
+========================================================================
+
+-- payment-events --
+[ ] T7.1   Idempotency check on Payment.externalReference
+[ ] T7.2   Strategy A: match by reference = order.id
+[ ] T7.3   Strategy B fallback: customer phone + amount (incl ambiguity/no-match handling)
+[ ] T7.4   Payment creation, all 17 fields incl rawWebhookPayload preservation
+[ ] T7.5   Order status transition on successful payment
+[ ] T7.6   Customer payment-confirmation WhatsApp message
+[ ] T7.7   Validate vs T0.11; reconcile one week of real payments across both stacks
+[ ] T7.8   Drain-and-cut payment-events
+
+-- crm-materialiser + handlers --
+[ ] T7.9   CustomerCaptureHandler.updateCustomerName
+[ ] T7.10  ProfileBuilderHandler: preference accumulation (case-insensitive dedup, cap 50), delivery-area latest-wins, sentiment change-only
+[ ] T7.11  Profile-missing defensive create path
+[ ] T7.12  OrderLedgerHandler short-ID resolution: hex validation, escapeLikePattern, LIKE prefix scoped businessId+is_available
+[ ] T7.13  Price snapshotting into OrderItem (ledger immutability) + Decimal totals
+[ ] T7.14  Order tx: create w/ idempotencyKey, OrderItem.createMany, P2002 duplicate-skip
+[ ] T7.15a Atomic conditional stock decrement in SQLC (per-product qty aggregation for duplicate line items)
+[ ] T7.15b Oversell guard: affected rows != expected -> rollback (sqlc catches text=uuid class at build time)
+[ ] T7.16  InsufficientStockError rollback semantics + warn-level log
+[ ] T7.17  updateProfileStats: totalOrders, totalSpent, averageOrderValue, lastOrderAt, orderFrequencyDays
+[ ] T7.18  Payment link gen + per-currency paymentMethods copy from CURRENCY_CONFIG (brand never named)
+[ ] T7.19  INVOICING transition w/ CAS guard + ESCALATED/INVOICING skip conditions
+[ ] T7.20  Durable follow-up scheduling (abandoned-cart +2h, unpaid-invoice-first +24h) via ScheduledFollowUp.createMany
+[ ] T7.21  Stage-level error context wrapper + failure logging
+[ ] T7.22  Drain-and-cut crm-materialiser
+
+-- follow-up + crons --
+[ ] T7.23a follow-up job: abandoned-cart (exact copy + currency formatting)
+[ ] T7.23b follow-up job: unpaid-invoice-first
+[ ] T7.23c follow-up job: unpaid-invoice-second
+[ ] T7.23d follow-up job: delivery-confirmation
+[ ] T7.23e follow-up job: re-engagement
+[ ] T7.24  Relevance re-check (skip if order since paid/cancelled)
+[ ] T7.25a follow-up-scanner */1 * * * *: due-row query
+[ ] T7.25b Scanner take:50 cap
+[ ] T7.25c Scanner CAS claim (executedAt null, cancelledAt null) preventing double-send
+[ ] T7.26a outbox-sweep */2 * * * *: stranded pending messages, take:100
+[ ] T7.26b Sweep re-enqueue + failed_stale marking (survives because asynq has no transactional enqueue)
+[ ] T7.27  retention-scanner 0 9 * * *: orderFrequencyDays threshold multiplier + re-engagement enqueue
+[ ] T7.28a Cron singleton: Postgres advisory lock (asynq has no leader election for periodic jobs)
+[ ] T7.28b Two-instance test proving no double-fire
+[ ] T7.29  ConversationStateService.transition: VALID_TRANSITIONS table, illegal rejection, CAS stale-state rejection (vs T0.12)
+[ ] T7.30  safety.guard.requiresEscalation keyword matching
+[ ] T7.31  Drain-and-cut follow-up; move 3 crons in ONE deploy
+[ ] T7.32  Delete example-queue + example.processor (dead code)
+[ ] T7.33  Full week orders+payments reconciled across stacks before stage done
+
+========================================================================
+STAGE 8 — MEASUREMENT GATE, ORCHESTRATOR PORT, FINAL QUEUE CONSOLIDATION
+Port is COMMITTED (ADR 0002). 8a sizes/schedules, does not decide whether.
+========================================================================
+
+-- 8a measurement gate --
+[ ] T8.1   Measure vs Stage 1 baseline: cost, p50/p99, incidents, deploy freq, feature lead time
+[ ] T8.2   Assess whether remaining Node causes operational problems (sequencing input, not go/no-go)
+[ ] T8.3   Estimate 8b at current velocity incl structured-output work
+
+-- 8b orchestrator port --
+[ ] T8.5   CatalogRetrieverService.getContextForBusiness (image-supplied branch)
+[ ] T8.6   semanticProductSearch: embed msg, (embedding <=> $2::vector) < 0.8, LIMIT 5, has_image EXISTS
+[ ] T8.7   formatProduct: short IDs, currency locale, stock suffix >0 only, [HAS_IMAGE], description handling
+[ ] T8.8   getFullCatalog + "showing X most relevant of Y+" header
+[ ] T8.9   searchFaqs + POLICIES & FAQs section
+[ ] T8.10  getImageMatchContext + IMAGE MATCH section w/ percentage scores
+[ ] T8.11  System prompt VERBATIM incl ${paymentMethods}/${conversationState} injection points
+[ ] T8.12a LlmResponseSchema -> Go JSON-schema, field descriptions preserved verbatim (load-bearing prompt text)
+[ ] T8.12b CrmSignalsSchema -> Go JSON-schema
+[ ] T8.13a Structured output: JSON-schema generation for both providers
+[ ] T8.13b Structured output: native structured-output mode calls
+[ ] T8.13c Structured output: response validation
+[ ] T8.13d Structured output: malformed-response retry path
+[ ] T8.14  Multimodal assembly (customer image on last user turn)
+[ ] T8.15  WhatsAppMediaService.downloadMedia + 10MB audio escalation threshold
+[ ] T8.16  AudioTranscriptionService.transcribe
+[ ] T8.17  fetchConversationHistory: last 10+10 merged, time-sorted, empty-filtered, sliced 10
+[ ] T8.18  resolveConversationContext: customer upsert + nested profile create, conversation upsert, lastContactAt bump
+[ ] T8.19  enforceSafetyGuardrails: escalation short-circuit + keyword match
+[ ] T8.20  Low-confidence escalation (< 0.7 internal_confidence)
+[ ] T8.21  getAlreadyShownProducts/buildShownImagesContext/gateProductImageIds (gating on explicit request NOT send history)
+[ ] T8.22  sendProductImages/enqueueOutboundImageMessage incl productId persistence + 24h branch
+[ ] T8.23  24h window compliance check in enqueueOutboundMessage
+[ ] T8.24  Intent-driven transitions (checkout_request, product_inquiry, image_match, support_faq, complaint) + source guards
+[ ] T8.25  CRM signal emission to crm-materialiser, non-blocking swallow-and-log
+[ ] T8.26  DESIGN debounce equivalent for asynq (today: fixed jobId + 3s delay collapsing rapid msgs into one LLM call)
+[ ] T8.27  Completion re-check closing debounce drop-window
+[ ] T8.28a Golden-transcript harness player (recorded conversations through both stacks)
+[ ] T8.28b Decision differ: intent/state/images-sent/CRM signals/order confirmation (reply wording may differ, decisions must not)
+[ ] T8.29  Shadow run 2 weeks: Go computes+logs, Node reply ships; continuous diff
+[ ] T8.30  Cost check: tokens/conversation flat or better
+[ ] T8.31  Cutover; Node orchestrator deployable one full month
+
+-- 8c final queue consolidation --
+[ ] T8.32  Port outbound.processor: load OutboundMessage, send via WhatsApp, persist metaResponse, pending->sent/failed
+[ ] T8.33  whatsappMessageId extraction/persistence + buildOutboundConversationLogContext
+[ ] T8.34  Move all three producers onto asynq in SAME change (orchestrator, order-ledger, follow-up)
+[ ] T8.35  Drain-and-cut outbound-queue; retire webhook-processing bridge shim; LAST BullMQ consumer exits
+
+========================================================================
+STAGE 9 — DECOMMISSION AND HARDENING
+========================================================================
+
+[ ] T9.1   One month clean operation since last cutover
+[ ] T9.2   Remove Node services from docker-compose.yml, Caddyfile, deploy.sh
+[ ] T9.3   Collapse Caddy routing to single upstream
+[ ] T9.4   Schema ownership Prisma -> Go tool, baselining all 14 migrations; from-empty apply = byte-identical schema
+[ ] T9.5   Delete apps/, libs/, prisma/ (post-baseline), package.json, nest-cli.json, jest.setup.ts, eslint.config.mjs, tsconfig*.json
+[ ] T9.6   Remove Node from CI; remove .nvmrc
+[ ] T9.7   Replace Dockerfile with Go build; final size/boot vs T1.10 baseline
+[ ] T9.8   Re-tune Postgres pool for Go connection model (DATABASE_POOL_MAX=10 was sized for Node)
+[ ] T9.9   Load-test full stack vs T1.13
+[ ] T9.10  Update README.md, docs/, onboarding
+[ ] T9.11  Characterization suite becomes permanent regression suite (runs vs Go)
+[ ] T9.12  Archive/delete MIGRATION_PLAN.md + this todo.txt
+[ ] T9.13  Retro vs T8.1 measurements
+
+========================================================================
+CROSS-CUTTING — verify PER STAGE (each maps to a Stage 0 test)
+========================================================================
+D.1 Tenant isolation  -> re-run T0.17 every stage adding endpoints
+D.2 Money             -> Decimal(14,2) end-to-end, no floats, minor-unit conversions at initiate/webhook/payout
+D.3 Idempotency       -> WebhookEvent/Order/Payment keys + ScheduledFollowUp CAS survive identically
+D.4 PII               -> scrub before first Sentry report; recorder scrubs pre-disk
+D.5 WhatsApp 24h      -> all THREE check sites ported; blocked sends recorded, never dropped
+D.6 Observability     -> log fields, metric names, Sentry fingerprints stable per cutover
+D.7 Rollback          -> no schema changes in cutover windows; rollback rehearsed; Node deployable until Stage 9
