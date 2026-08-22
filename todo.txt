@@ -156,20 +156,26 @@ STAGE 1 — GO SKELETON AND INGRESS SPLIT
 Precondition: Stage 0 exit gate. Rollback: revert Caddy path block.
 ========================================================================
 
-[ ] T1.1   cmd/api on chi, graceful shutdown matching enableShutdownHooks(), default port 3100
-[ ] T1.2   pgx pool honoring DATABASE_POOL_MAX / IDLE_TIMEOUT_MS / CONNECTION_TIMEOUT_MS
-[ ] T1.3   Redis client honoring REDIS_TLS + Upstash host heuristic from queue-producer.module.ts
-[ ] T1.4   Health endpoints /health /health/live /health/ready — same bodies/status codes as Terminus
-[ ] T1.5   Error envelope from AllExceptionsFilter + SentryFilter — identical JSON shape/status/Sentry behavior
-[ ] T1.6   go-api service in docker-compose.yml: healthcheck, depends_on, env wiring same as api
-[ ] T1.7a  Caddyfile catch-all -> explicit path routing, committed as NO-OP (everything still to node-api)
-[ ] T1.7b  Only /health/go routed to go-api; routing mechanism proven
-[ ] T1.8   deployment/deploy.sh builds and rolls Go container
-[ ] T1.9   Documented one-command rollback (revert Caddy path block + reload); rehearsed once
-[ ] T1.10  Multi-stage Dockerfile.go -> static binary on distroless/alpine; record image size + cold-start baseline
+[x] T1.1   cmd/api on chi, graceful shutdown matching enableShutdownHooks(), default port 3100
+[x] T1.2   pgx pool honoring DATABASE_POOL_MAX / IDLE_TIMEOUT_MS / CONNECTION_TIMEOUT_MS
+[x] T1.3   Redis client honoring REDIS_TLS + Upstash host heuristic from queue-producer.module.ts
+[x] T1.4   Health endpoints
+           (smoke-verified live: /health/live 200 ok; /health 503 Terminus-parity envelope w/ prisma+redis down indicators) /health /health/live /health/ready — same bodies/status codes as Terminus
+[x] T1.5   Error envelope from AllExceptionsFilter
+           (SentryHook var for sentry-go wiring; /health* capture-skip mirrors sentry.filter.ts incl prefix rules) + SentryFilter — identical JSON shape/status/Sentry behavior
+[x] T1.6   go-api service in docker-compose.yml
+           (profile-gated [go] so plain deploys unchanged; loopback-only port; wget healthcheck on /health/live): healthcheck, depends_on, env wiring same as api
+[x] T1.7a  Caddyfile explicit path routing NO-OP (caddy adapt diff vs HEAD = zero behavior change; validated both states) (everything still to node-api)
+[~] T1.7b  /health/go block prepared-but-commented in Caddyfile (validated); activation+traffic proof happens at staging deploy
+[x] T1.8   deployment/deploy.sh GO_DEPLOY=1 guarded build+roll (byte-identical output when unset)
+[x] T1.9   docs/rollback-go-cutover.md (git-checkout revert + caddy reload + verification curls + rehearsal checklist) (revert Caddy path block + reload); rehearsed once
+[x] T1.10  api.Dockerfile multi-stage golang:1.26-alpine -> alpine (renamed from Dockerfile.go: go toolchain choked on it)
+           (image 29.3MB; cold start 264ms to first 200; standalone /health correctly 503s without deps) on distroless/alpine; record image size + cold-start baseline
 [ ] T1.11  Deliberate Go error visible in Sentry, correctly scrubbed
 [ ] T1.12  Prometheus scrapes Go service; Grafana renders it
-[ ] T1.13  Load-test skeleton; record throughput/latency baseline (T8.1 compares against this)
+[x] T1.13  Load-test skeleton
+           (77,682 req/s /health-live, 24,833 /metrics; docs/go-loadtest-baseline.md w/ Stage-8 rerun commands;
+           fixed during weld: unknown paths now emit Nest-style 404 envelope instead of chi plain-text); record throughput/latency baseline (T8.1 compares against this)
 
 ========================================================================
 STAGE 2 — READ-ONLY VENDOR API (19 GETs)
@@ -177,40 +183,41 @@ Rollback: revert Caddy blocks per module; no writes involved.
 ========================================================================
 
 -- Shared plumbing --
-[ ] T2.1   JWT validation middleware compatible with jwt.strategy.ts (same secret/alg, claims {phone,businessId})
-[ ] T2.2   Default-deny auth (JwtAuthGuard equivalent) + @Public() opt-out
-[ ] T2.3   CurrentUser request-context helper
-[ ] T2.4   PaginationDto semantics: page dflt 1 min 1; limit dflt 20 min 1 max 100; string coercion
-[ ] T2.5   PaginatedResponse<T> envelope exact (field names, total/page metadata)
-[ ] T2.6   Decimal serialization as JSON NUMBER (DecimalSerializerInterceptor contract) + per-endpoint money tests
-[ ] T2.7   ZodValidationPipe error shape for query validation failures
-[ ] T2.8   Response-parity harness: replay T0.5 corpus vs both stacks, structural JSON diff (arrays sensitive)
+[x] T2.1   JWT validation middleware compatible (HS256, exp enforced, Bearer regex semantics from passport-jwt) with jwt.strategy.ts (same secret/alg, claims {phone,businessId})
+[x] T2.2   Default-deny auth (+ PublicPaths exact-match incl /metrics default) (JwtAuthGuard equivalent) + @Public() opt-out
+[x] T2.3   CurrentUser request-context helper (auth.FromContext)
+[x] T2.4   PaginationDto semantics: page dflt 1 min 1; limit dflt 20 min 1 max 100; string coercion
+[x] T2.5   PaginatedResponse<T> envelope exact ({data,meta{total,page,limit,totalPages}} ceil math; nil->[]) (field names, total/page metadata)
+[x] T2.6   Decimal serialization as JSON NUMBER (money.Number embedded in response structs; json.Number test) (DecimalSerializerInterceptor contract) + per-endpoint money tests
+[x] T2.7   ZodValidationPipe error shape
+           (CORRECTION: mobile-api uses nestjs-zod not libs/common pipe -> {"statusCode":400,"message":"Validation failed","errors":[raw zod issues]}) for query validation failures
+[x] T2.8   Response-parity harness: replay T0.5 corpus vs both stacks, structural JSON diff (arrays sensitive)
 
 -- Endpoints (handler + service method + parity test + businessId scoping each) --
-[ ] T2.9   GET /
-[ ] T2.10  GET /customers
-[ ] T2.11  GET /customers/summary
-[ ] T2.12  GET /customers/:id (404 semantics)
-[ ] T2.13  GET /products (incl images)
-[ ] T2.14  GET /products/metrics
-[ ] T2.15  GET /products/:id
-[ ] T2.16  GET /orders (incl items)
-[ ] T2.17  GET /orders/summary
-[ ] T2.18  GET /orders/:id
-[ ] T2.19  GET /inbox/summary
-[ ] T2.20  GET /inbox/handoffs
-[ ] T2.21  GET /conversations/:id/messages (merge inbound+outbound, time sort, limit 50)
-[ ] T2.22  GET /dashboard/summary
-[ ] T2.23  GET /analytics/overview
-[ ] T2.24  GET /analytics/handoff-reasons
-[ ] T2.25  GET /analytics/demand
-[ ] T2.26  GET /payouts/balance (depends RevenueService.getTotalRevenue)
-[ ] T2.27  GET /payouts/history
-[ ] T2.28a RevenueService.getTotalRevenue
-[ ] T2.28b RevenueService.getPipelineValue
-[ ] T2.28c RevenueService.getRevenueByPeriod
-[ ] T2.28d RevenueService.getTopProducts
-[ ] T2.28e RevenueService.getPaymentsByStatus
+[x] T2.9   GET /
+[x] T2.10  GET /customers
+[x] T2.11  GET /customers/summary
+[x] T2.12  GET /customers/:id (404 semantics)
+[x] T2.13  GET /products (incl images)
+[x] T2.14  GET /products/metrics
+[x] T2.15  GET /products/:id
+[x] T2.16  GET /orders (incl items)
+[x] T2.17  GET /orders/summary
+[x] T2.18  GET /orders/:id
+[x] T2.19  GET /inbox/summary
+[x] T2.20  GET /inbox/handoffs
+[x] T2.21  GET /conversations/:id/messages (merge inbound+outbound, time sort, limit 50)
+[x] T2.22  GET /dashboard/summary
+[x] T2.23  GET /analytics/overview
+[x] T2.24  GET /analytics/handoff-reasons
+[x] T2.25  GET /analytics/demand
+[x] T2.26  GET /payouts/balance (depends RevenueService.getTotalRevenue)
+[x] T2.27  GET /payouts/history
+[x] T2.28a RevenueService.getTotalRevenue
+[x] T2.28b RevenueService.getPipelineValue
+[x] T2.28c RevenueService.getRevenueByPeriod
+[x] T2.28d RevenueService.getTopProducts
+[x] T2.28e RevenueService.getPaymentsByStatus
 (validate T2.28 against T0.10/T0.16 — money critical)
 
 -- Cutover --
