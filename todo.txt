@@ -232,18 +232,18 @@ STAGE 3 — AUTHENTICATION
 Rollback: revert Caddy block; tokens valid on both stacks by construction.
 ========================================================================
 
-[ ] T3.1   OtpService.generateOtp: code length, charset, Redis key format
-[ ] T3.2   OtpService.verifyOtp: TTL 5min, single-use, failure counting
-[ ] T3.3   Cross-validation: OTP issued by Node verifies in Go and vice versa
-[ ] T3.4   WhatsApp OTP delivery (sendTextMessage)
-[ ] T3.5   Email OTP delivery (SMTP/Zoho, port 465 TLS)
-[ ] T3.6   POST /auth/request-otp incl deliveryMethod branch + delivery-failure error wrapping
-[ ] T3.7   POST /auth/verify-otp: token minting, isNewUser derivation, business payload
-[ ] T3.8   GET /auth/me
-[ ] T3.9   Cross-validation: Node-minted JWT validates in Go AND Go-minted validates in Node (claims/exp/alg)
-[ ] T3.10  Throttling on request-otp + trust-proxy so limits key off real client IP behind Caddy
-[ ] T3.11  JWT_SECRET length validation fails Go startup like Node
-[ ] T3.12  Auth-failure-rate alert BEFORE cutover
+[x] T3.1   OtpService.generateOtp: code length, charset, Redis key format
+[x] T3.2   OtpService.verifyOtp: TTL 5min, single-use, failure counting
+[x] T3.3   Cross-validation: OTP issued by Node verifies in Go and vice versa
+[x] T3.4   WhatsApp OTP delivery (sendTextMessage)
+[x] T3.5   Email OTP delivery (SMTP/Zoho, port 465 TLS)
+[x] T3.6   POST /auth/request-otp incl deliveryMethod branch + delivery-failure error wrapping
+[x] T3.7   POST /auth/verify-otp: token minting, isNewUser derivation, business payload
+[x] T3.8   GET /auth/me
+[x] T3.9   Cross-validation both directions LIVE (OTP Node<->Go via redis; JWT Go-minted verified by node jsonwebtoken AND node /auth/me 200; Node-minted parsed by Go)
+[x] T3.10  Throttling on request-otp + trust-proxy so limits key off real client IP behind Caddy
+[x] T3.11  JWT_SECRET length validation fails Go startup like Node
+[~] T3.12  Auth-failure-rate alert drafted (docs/alert-auth-failures.md); apply in staging Grafana before cutover
 [ ] T3.13  Cut /auth/* to Go; monitor 48h
 
 ========================================================================
@@ -251,39 +251,39 @@ STAGE 4 — VENDOR API WRITES + IMAGE PIPELINE
 Rollback: revert Caddy blocks; writes persist — safe only because no schema change ships (A.3b).
 ========================================================================
 
-[ ] T4.1   Decide + record how embedding enqueue works during this stage (bridge vs defer to Stage 6)
-[ ] T4.2a  DTO validation + zod error shape: CreateBusinessDto
-[ ] T4.2b  DTO: CreateProductDto
-[ ] T4.2c  DTO: UpdateProductDto
-[ ] T4.2d  DTO: ReorderImagesDto
-[ ] T4.2e  DTO: ReplyDto
-[ ] T4.2f  DTO: UpdateOrderDto
-[ ] T4.2g  DTO: RequestPayoutDto
-[ ] T4.2h  DTO: RequestOtpDto
-[ ] T4.2i  DTO: VerifyOtpDto
-[ ] T4.3   POST /businesses (owner-phone binding)
-[ ] T4.4   POST /products (+embedding enqueue per T4.1)
-[ ] T4.5   PATCH /products/:id (re-embed on name/description change)
-[ ] T4.6   DELETE /products/:id (cascade + best-effort Cloudinary delete)
-[ ] T4.7   POST /products/:id/out-of-stock
-[ ] T4.8   StorageProvider interface + factory
-[ ] T4.9   Cloudinary provider: uploadImage (folder novoapex), deleteImage
-[ ] T4.10  Multipart handling, same count/size limits as today
-[ ] T4.11  POST /products/:id/image (single) + /images (multi), max 5/product
-[ ] T4.12  SHA-256 content-hash dedup (@@unique productId+contentHash; NULL-distinct for legacy rows)
-[ ] T4.13  DELETE image: position re-densification + non-blocking asset-delete failure
-[ ] T4.14  PUT reorder: dense position invariant under @@unique(productId,position), two-phase/deferred constraint
-[ ] T4.15  Image-embedding enqueue on upload
-[ ] T4.16  PATCH /orders/:id/fulfillment (valid status set)
-[ ] T4.17  POST /orders/:id/escalate
-[ ] T4.18  POST /conversations/:id/takeover (isEscalatedToHuman)
-[ ] T4.19  POST /conversations/:id/release
-[ ] T4.20  POST /conversations/:id/reply (24h window rule; OutboundMessage + enqueue per T4.1)
-[ ] T4.21  POST /payouts/request: createTransferRecipient caching (paystackRecipientCode) + initiateTransfer — MONEY PATH, validate vs T0.16
+[x] T4.1   DECIDED: defer job enqueue — EmbedPublisher/OutboundPublisher interfaces + Null impls at exact Node enqueue points; real asynq/BullMQ bridge lands Stages 6-8 (ADR 0001)
+[x] T4.2a  DTO validation + zod error shape: CreateBusinessDto
+[x] T4.2b  DTO: CreateProductDto
+[x] T4.2c  DTO: UpdateProductDto
+[x] T4.2d  DTO: ReorderImagesDto
+[x] T4.2e  DTO: ReplyDto
+[x] T4.2f  DTO: UpdateOrderDto
+[x] T4.2g  DTO: RequestPayoutDto
+[x] T4.2h  DTO: RequestOtpDto
+[x] T4.2i  DTO: VerifyOtpDto
+[x] T4.3   POST /businesses (owner-phone binding)
+[x] T4.4   POST /products (+embedding enqueue per T4.1)
+[x] T4.5   PATCH /products/:id (re-embed on name/description change)
+[x] T4.6   DELETE /products/:id (cascade + best-effort Cloudinary delete)
+[x] T4.7   POST /products/:id/out-of-stock
+[x] T4.8   StorageProvider interface + factory
+[x] T4.9   Cloudinary provider: uploadImage (folder novoapex), deleteImage
+[x] T4.10  Multipart handling, same count/size limits as today
+[x] T4.11  POST /products/:id/image (single) + /images (multi), max 5/product
+[x] T4.12  SHA-256 content-hash dedup (@@unique productId+contentHash; NULL-distinct for legacy rows)
+[x] T4.13  DELETE image: position re-densification + non-blocking asset-delete failure
+[x] T4.14  PUT reorder: dense position invariant under @@unique(productId,position), two-phase/deferred constraint
+[x] T4.15  Image-embedding enqueue on upload
+[x] T4.16  PATCH /orders/:id/fulfillment (valid status set)
+[x] T4.17  POST /orders/:id/escalate
+[x] T4.18  POST /conversations/:id/takeover (isEscalatedToHuman)
+[x] T4.19  POST /conversations/:id/release
+[x] T4.20  POST /conversations/:id/reply (24h window rule; OutboundMessage + enqueue per T4.1)
+[x] T4.21  POST /payouts/request: createTransferRecipient caching (paystackRecipientCode) + initiateTransfer — MONEY PATH, validate vs T0.16
 [ ] T4.22  OpenAPI/Swagger generation for vendor surface
-[ ] T4.23a Concurrency: simultaneous image reorder
-[ ] T4.23b Concurrency: simultaneous payout request
-[ ] T4.23c Concurrency: simultaneous product update
+[x] T4.23a Concurrency: simultaneous image reorder
+[x] T4.23b Concurrency: simultaneous payout request
+[x] T4.23c Concurrency: simultaneous product update
 [ ] T4.24  Cut remaining vendor paths to Go, module by module
 [ ] T4.25  Soak one week
 
