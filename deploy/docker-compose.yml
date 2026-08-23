@@ -1,0 +1,199 @@
+# NovOApex Go backend — TARGET-STATE STACK
+#
+# This is the post-migration deployment: every service is Go (or infra).
+# It is intentionally independent of ../novoapex — no build contexts,
+# no env files, no Node containers.
+#
+# Bring-up:  cp .env.example .env && edit, then
+#            docker compose --env-file .env up -d --build
+#
+# Migrations: Prisma owns the schema until Stage 9 (ADR: plan §A.3). Run them
+# once per deploy from a novoapex checkout:
+#   docker compose --profile migrate --env-file .env run --rm migrate
+#
+# Queue dashboard: http://<host>/admin/queues (basic auth from BULL_BOARD_*)
+name: novoapex-go
+
+services:
+  caddy:
+    image: caddy:2-alpine
+    container_name: novoapex_go_caddy
+    restart: unless-stopped
+    depends_on:
+      go-api:
+        condition: service_healthy
+      asynqmon-auth:
+        condition: service_started
+    environment:
+      - DOMAIN=${DOMAIN:?Set DOMAIN in .env}
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+
+  go-api:
+    build:
+      context: ..
+      dockerfile: api.Dockerfile
+    container_name: novoapex_go_api
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      - NODE_ENV=production
+      - PORT=3100
+      - DATABASE_URL=postgresql://postgres:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}@db:5432/novoapex?schema=public
+      - DATABASE_POOL_MAX=${DATABASE_POOL_MAX:-10}
+      - DATABASE_POOL_IDLE_TIMEOUT_MS=${DATABASE_POOL_IDLE_TIMEOUT_MS:-30000}
+      - DATABASE_POOL_CONNECTION_TIMEOUT_MS=${DATABASE_POOL_CONNECTION_TIMEOUT_MS:-10000}
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - REDIS_PASSWORD=${REDIS_PASSWORD:?Set REDIS_PASSWORD in .env}
+      - JWT_SECRET=${JWT_SECRET:?Set JWT_SECRET (>=32 chars) in .env}
+      - WHATSAPP_VERIFY_TOKEN=${WHATSAPP_VERIFY_TOKEN:-}
+      - WHATSAPP_API_VERSION=${WHATSAPP_API_VERSION:-v25.0}
+      - WHATSAPP_PHONE_NUMBER_ID=${WHATSAPP_PHONE_NUMBER_ID:-}
+      - WHATSAPP_ACCESS_TOKEN=${WHATSAPP_ACCESS_TOKEN:-}
+      - WHATSAPP_APP_SECRET=${WHATSAPP_APP_SECRET:-}
+      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
+      - OPENAI_BASE_URL=${OPENAI_BASE_URL:-}
+      - GOOGLE_GENERATIVE_AI_API_KEY=${GOOGLE_GENERATIVE_AI_API_KEY:-}
+      - PAYSTACK_SECRET_KEY=${PAYSTACK_SECRET_KEY:-}
+      - PAYSTACK_PUBLIC_KEY=${PAYSTACK_PUBLIC_KEY:-}
+      - SMTP_HOST=${SMTP_HOST:-smtp.zoho.com}
+      - SMTP_PORT=${SMTP_PORT:-465}
+      - SMTP_USER=${SMTP_USER:-}
+      - SMTP_PASS=${SMTP_PASS:-}
+      - CLOUDINARY_CLOUD_NAME=${CLOUDINARY_CLOUD_NAME:-}
+      - CLOUDINARY_API_KEY=${CLOUDINARY_API_KEY:-}
+      - CLOUDINARY_API_SECRET=${CLOUDINARY_API_SECRET:-}
+      - SENTRY_DSN=${SENTRY_DSN:-}
+      - SENTRY_ENVIRONMENT=${SENTRY_ENVIRONMENT:-production}
+      - SENTRY_RELEASE=${SENTRY_RELEASE:-}
+      - LOG_LEVEL=${LOG_LEVEL:-info}
+    expose:
+      - "3100"
+
+  go-worker:
+    build:
+      context: ..
+      dockerfile: worker.Dockerfile
+    container_name: novoapex_go_worker
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      - NODE_ENV=production
+      - DATABASE_URL=postgresql://postgres:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}@db:5432/novoapex?schema=public
+      - DATABASE_POOL_MAX=${WORKER_DATABASE_POOL_MAX:-10}
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - REDIS_PASSWORD=${REDIS_PASSWORD:?Set REDIS_PASSWORD in .env}
+      - JWT_SECRET=${JWT_SECRET:?Set JWT_SECRET (>=32 chars) in .env}
+      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
+      - OPENAI_BASE_URL=${OPENAI_BASE_URL:-}
+      - GOOGLE_GENERATIVE_AI_API_KEY=${GOOGLE_GENERATIVE_AI_API_KEY:-}
+      - PAYSTACK_SECRET_KEY=${PAYSTACK_SECRET_KEY:-}
+      - PAYSTACK_BASE_URL=${PAYSTACK_BASE_URL:-https://api.paystack.co}
+      - WHATSAPP_API_VERSION=${WHATSAPP_API_VERSION:-v25.0}
+      - WHATSAPP_PHONE_NUMBER_ID=${WHATSAPP_PHONE_NUMBER_ID:-}
+      - WHATSAPP_ACCESS_TOKEN=${WHATSAPP_ACCESS_TOKEN:-}
+      - WHATSAPP_APP_SECRET=${WHATSAPP_APP_SECRET:-}
+      - SMTP_HOST=${SMTP_HOST:-smtp.zoho.com}
+      - SMTP_PORT=${SMTP_PORT:-465}
+      - SMTP_USER=${SMTP_USER:-}
+      - SMTP_PASS=${SMTP_PASS:-}
+      - SENTRY_DSN=${SENTRY_DSN:-}
+      - SENTRY_ENVIRONMENT=${SENTRY_ENVIRONMENT:-production}
+      - LOG_LEVEL=${LOG_LEVEL:-info}
+      # - WORKER_CONCURRENCY=10
+
+  asynqmon:
+    image: hibiken/asynqmon:v0.7.2
+    container_name: novoapex_go_asynqmon
+    restart: unless-stopped
+    depends_on:
+      redis:
+        condition: service_healthy
+    environment:
+      - REDIS_ADDR=redis:6379
+      - REDIS_PASSWORD=${REDIS_PASSWORD:?Set REDIS_PASSWORD in .env}
+
+  asynqmon-auth:
+    image: caddy:2-alpine
+    container_name: novoapex_go_asynqmon_auth
+    restart: unless-stopped
+    depends_on:
+      - asynqmon
+    environment:
+      - BULL_BOARD_USER=${BULL_BOARD_USER:?Set BULL_BOARD_USER in .env}
+      - BULL_BOARD_PASSWORD=${BULL_BOARD_PASSWORD:?Set BULL_BOARD_PASSWORD in .env}
+    command: >
+      sh -c 'HASH=$$(caddy hash-password --plaintext "$$BULL_BOARD_PASSWORD") &&
+             printf "%s\n" \
+               ":8081 {" \
+               "  basic_auth {" \
+               "    \"$$BULL_BOARD_USER\" \"$$HASH\"" \
+               "  }" \
+               "  reverse_proxy asynqmon:8080" \
+               "}" > /tmp/Caddyfile &&
+             exec caddy run --config /tmp/Caddyfile --adapter caddyfile'
+
+  db:
+    image: pgvector/pgvector:pg15
+    container_name: novoapex_go_db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
+      POSTGRES_DB: novoapex
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./init-db.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d novoapex"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+
+  redis:
+    image: redis:7-alpine
+    container_name: novoapex_go_redis
+    restart: unless-stopped
+    command: ["redis-server", "--requirepass", "${REDIS_PASSWORD:?Set REDIS_PASSWORD in .env}", "--appendonly", "yes"]
+    environment:
+      - REDIS_PASSWORD=${REDIS_PASSWORD:?Set REDIS_PASSWORD in .env}
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli -a \"$$REDIS_PASSWORD\" ping | grep PONG"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+
+  migrate:
+    profiles:
+      - migrate
+    image: node:22-alpine
+    container_name: novoapex_go_migrate
+    working_dir: /work
+    volumes:
+      - ../../novoapex/prisma:/work/prisma:ro
+    environment:
+      - DATABASE_URL=postgresql://postgres:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}@db:5432/novoapex?schema=public
+    entrypoint: sh -c 'npm exec -y prisma@6 -- migrate deploy --schema /work/prisma/schema.prisma'
+
+volumes:
+  postgres_data:
+  redis_data:
+  caddy_data:
+  caddy_config:

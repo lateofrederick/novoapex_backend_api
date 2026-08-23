@@ -41,6 +41,22 @@ Prisma remains the migration source of truth until Stage 9 (plan §A.3). After a
 
 This regenerates `internal/db/schema/schema.sql` for sqlc.
 
+## Deployment (standalone Go stack)
+
+`deploy/` holds the target-state stack — every service is Go or infra, no Node
+containers, no dependency on the novoapex checkout at runtime:
+
+```
+cd deploy
+cp .env.example .env      # fill in secrets + DOMAIN
+./deploy.sh up            # build + start caddy/go-api/go-worker/db/redis/asynqmon
+./deploy.sh migrate       # apply prisma migrations (needs ../novoapex checkout; until Stage 9)
+./deploy.sh roll          # rebuild+restart api and worker only
+```
+
+Dashboard: `https://$DOMAIN/admin/queues` (basic auth from BULL_BOARD_*).
+Rollback to Node: novoapex/docs/rollback-go-cutover.md.
+
 ## Development
 
 ```
