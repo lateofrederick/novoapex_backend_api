@@ -61,22 +61,113 @@ type textObject struct {
 // (whatsapp.service.ts). Non-2xx replies are surfaced as
 // "Meta API error: <raw body>" exactly like the Node service wraps them.
 func (c *Client) SendTextMessage(ctx context.Context, phoneNumberID, to, text string) error {
-	url := fmt.Sprintf("%s/%s/%s/messages", strings.TrimSuffix(c.BaseURL, "/"), c.Version, phoneNumberID)
+	_, err := c.SendTextMessageData(ctx, phoneNumberID, to, text)
+	return err
+}
 
-	payload := sendPayload{
+// SendTextMessageData is sendTextMessage with its return value: the parsed
+// Meta response (messages.controller.ts feeds it into
+// {success:true,data:<result>}). Shares the sendMessage HTTP path with the
+// template/image sends below (T5.19d).
+func (c *Client) SendTextMessageData(ctx context.Context, phoneNumberID, to, text string) (map[string]any, error) {
+	return c.sendMessage(ctx, phoneNumberID, sendPayload{
 		MessagingProduct: "whatsapp",
 		To:               to,
 		Type:             "text",
 		Text:             &textObject{Body: text},
+	})
+}
+
+// templateObject renders whatsapp.service.ts's
+// {template:{name, language:{code}}} block.
+type templateObject struct {
+	Name     string         `json:"name"`
+	Language languageObject `json:"language"`
+}
+
+type languageObject struct {
+	Code string `json:"code"`
+}
+
+type templatePayload struct {
+	MessagingProduct string         `json:"messaging_product"`
+	To               string         `json:"to"`
+	Type             string         `json:"type"`
+	Template         templateObject `json:"template"`
+}
+
+// SendTemplateMessage ports sendTemplateMessage (whatsapp.service.ts:25-41).
+// languageCode "" applies the source's default parameter en_US.
+func (c *Client) SendTemplateMessage(ctx context.Context, phoneNumberID, to, templateName, languageCode string) (map[string]any, error) {
+	if languageCode == "" {
+		languageCode = "en_US"
 	}
+	return c.sendMessage(ctx, phoneNumberID, templatePayload{
+		MessagingProduct: "whatsapp",
+		To:               to,
+		Type:             "template",
+		Template: templateObject{
+			Name:     templateName,
+			Language: languageObject{Code: languageCode},
+		},
+	})
+}
+
+// imageObject carries the link-based image; Caption "" is omitted exactly
+// like the source's `if (caption)` guard (whatsapp.service.ts:55-57).
+type imageObject struct {
+	Link    string `json:"link"`
+	Caption string `json:"caption,omitempty"`
+}
+
+type imagePayload struct {
+	MessagingProduct string      `json:"messaging_product"`
+	To               string      `json:"to"`
+	Type             string      `json:"type"`
+	Image            imageObject `json:"image"`
+}
+
+// SendImageMessage ports sendImageMessage (whatsapp.service.ts:43-59): a
+// LINK-based image payload ({image:{link}}), not a Meta media id upload.
+func (c *Client) SendImageMessage(ctx context.Context, phoneNumberID, to, imageURL, caption string) (map[string]any, error) {
+	return c.sendMessage(ctx, phoneNumberID, imagePayload{
+		MessagingProduct: "whatsapp",
+		To:               to,
+		Type:             "image",
+		Image:            imageObject{Link: imageURL, Caption: caption},
+	})
+}
+
+// ExtractMessageId ports extractMessageId (whatsapp.service.ts:90-92):
+// metaResponse?.messages?.[0]?.id — empty string stands in for undefined.
+func ExtractMessageId(respJSON []byte) string {
+	var resp struct {
+		Messages []struct {
+			ID string `json:"id"`
+		} `json:"messages"`
+	}
+	if err := json.Unmarshal(respJSON, &resp); err != nil || len(resp.Messages) == 0 {
+		return ""
+	}
+	return resp.Messages[0].ID
+}
+
+// sendMessage is the shared HTTP path of whatsapp.service.ts's private
+// sendMessage (:61-88): POST ${base}/${version}/${phoneNumberID}/messages
+// with Bearer auth, then parse; non-2xx becomes
+// "Meta API error: <re-encoded body>". The legacy SendTextMessage keeps its
+// Stage 3 observable behaviour by delegating here.
+func (c *Client) sendMessage(ctx context.Context, phoneNumberID string, payload any) (map[string]any, error) {
+	url := fmt.Sprintf("%s/%s/%s/messages", strings.TrimSuffix(c.BaseURL, "/"), c.Version, phoneNumberID)
+
 	raw, err := json.Marshal(payload)
 	if err != nil {
-		return fmt.Errorf("whatsapp: encode payload: %w", err)
+		return nil, fmt.Errorf("whatsapp: encode payload: %w", err)
 	}
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(raw))
 	if err != nil {
-		return fmt.Errorf("whatsapp: build request: %w", err)
+		return nil, fmt.Errorf("whatsapp: build request: %w", err)
 	}
 	req.Header.Set("Authorization", "Bearer "+c.Token)
 	req.Header.Set("Content-Type", "application/json")
@@ -87,21 +178,21 @@ func (c *Client) SendTextMessage(ctx context.Context, phoneNumberID, to, text st
 	}
 	resp, err := httpClient.Do(req)
 	if err != nil {
-		return fmt.Errorf("whatsapp: POST %s: %w", url, err)
+		return nil, fmt.Errorf("whatsapp: POST %s: %w", url, err)
 	}
 	defer func() { _ = resp.Body.Close() }()
 
-	var data any
+	var data map[string]any
 	if err := json.NewDecoder(resp.Body).Decode(&data); err != nil && resp.StatusCode >= 200 && resp.StatusCode < 300 {
-		return fmt.Errorf("whatsapp: decode response: %w", err)
+		return nil, fmt.Errorf("whatsapp: decode response: %w", err)
 	}
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		// Meta error envelope: {"error":{"message":...,"type":...,"code":...}}
 		// Capitalisation mirrors whatsapp.service.ts's exact Error text.
-		return fmt.Errorf("Meta API error: %s", reEncode(data)) //nolint:staticcheck // node parity
+		return nil, fmt.Errorf("Meta API error: %s", reEncode(data)) //nolint:staticcheck // node parity
 	}
-	return nil
+	return data, nil
 }
 
 func reEncode(v any) string {

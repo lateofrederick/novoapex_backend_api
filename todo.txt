@@ -293,38 +293,38 @@ Rollback: revert Caddy block; bridged jobs must drain first — rehearse drain p
 ========================================================================
 
 -- WhatsApp ingest --
-[ ] T5.1   GET /webhooks/whatsapp hub.challenge verification (raw challenge, correct content type)
-[ ] T5.2   Raw-body capture middleware; router must not consume body before signature check (fails open otherwise)
-[ ] T5.3   X-Hub-Signature-256 HMAC-SHA256, constant-time compare + length check (whatsapp.controller.ts:59-74)
-[ ] T5.4   Preserve unset-WHATSAPP_APP_SECRET warn-and-skip behavior (F.4f decides fail-closed separately)
-[ ] T5.5   Payload walk entry[]->changes[]->value.messages[], metadata.phone_number_id -> recipientPhone
-[ ] T5.6   object !== whatsapp_business_account early return
-[ ] T5.7   Idempotency key derivation + enqueue via bridge (Go writes rows in tx; Node shim enqueues to BullMQ)
-[ ] T5.8   @SkipThrottle() behavior preserved (Meta bursts from few IPs)
-[ ] T5.9   Referral capture logging (source_type/source_id/source_url/headline)
-[ ] T5.10a Signature rejection test: tampered body
-[ ] T5.10b Signature rejection test: missing header
-[ ] T5.10c Signature rejection test: wrong secret
-[ ] T5.10d Signature rejection test: truncated signature
-[ ] T5.10e Signature rejection test: valid signature over different body
+[x] T5.1   GET /webhooks/whatsapp hub.challenge verification (raw challenge, correct content type)
+[x] T5.2   Raw-body capture middleware; router must not consume body before signature check (fails open otherwise)
+[x] T5.3   X-Hub-Signature-256 HMAC-SHA256, constant-time compare + length check (whatsapp.controller.ts:59-74)
+[x] T5.4   Preserve unset-WHATSAPP_APP_SECRET warn-and-skip behavior (F.4f decides fail-closed separately)
+[x] T5.5   Payload walk entry[]->changes[]->value.messages[], metadata.phone_number_id -> recipientPhone
+[x] T5.6   object !== whatsapp_business_account early return
+[x] T5.7   Idempotency key derivation + enqueue via bridge (Go writes rows in tx; Node shim enqueues to BullMQ)
+[x] T5.8   @SkipThrottle() behavior preserved (Meta bursts from few IPs)
+[x] T5.9   Referral capture logging (source_type/source_id/source_url/headline)
+[x] T5.10a Signature rejection test: tampered body
+[x] T5.10b Signature rejection test: missing header
+[x] T5.10c Signature rejection test: wrong secret
+[x] T5.10d Signature rejection test: truncated signature
+[x] T5.10e Signature rejection test: valid signature over different body
 
 -- Payments ingest --
-[ ] T5.11  POST /webhooks/payments/:provider with raw-body handling
-[ ] T5.12  Paystack verifyWebhookSignature: HMAC-SHA512 raw body, x-paystack-signature, constant-time
-[ ] T5.13  parseWebhookEvent -> NormalisedPaymentEvent (minor->major, businessId from metadata, paidAt)
-[ ] T5.14  PaymentProviderFactory as Go interface + registry (getProvider/getDefault/getAvailable)
-[ ] T5.15  initiatePayment (minor units, callback URL, metadata businessId, authorization_url)
-[ ] T5.16  createTransferRecipient + initiateTransfer
-[ ] T5.17  Enqueue payment-events via A.1 mechanism
-[ ] T5.18  Replay captured Paystack webhook corpus vs both stacks; diff DB state
+[x] T5.11  POST /webhooks/payments/:provider with raw-body handling
+[x] T5.12  Paystack verifyWebhookSignature: HMAC-SHA512 raw body, x-paystack-signature, constant-time
+[x] T5.13  parseWebhookEvent -> NormalisedPaymentEvent (minor->major, businessId from metadata, paidAt)
+[x] T5.14  PaymentProviderFactory as Go interface + registry (getProvider/getDefault/getAvailable)
+[x] T5.15  initiatePayment (minor units, callback URL, metadata businessId, authorization_url)
+[x] T5.16  createTransferRecipient + initiateTransfer
+[x] T5.17  Enqueue payment-events via A.1 mechanism
+[x] T5.18 Replay captured webhook payloads -> LIVE Node stack vs Go ingest+asynq pipeline over identically-migrated DBs; webhook_events key sets + decoded inbound_messages DeepEqual (ids/timestamps stripped)
 
 -- Messages and admin --
-[ ] T5.19a WhatsAppService.sendTextMessage
-[ ] T5.19b WhatsAppService.sendTemplateMessage
-[ ] T5.19c WhatsAppService.sendImageMessage
-[ ] T5.19d Shared sendMessage HTTP path
-[ ] T5.19e extractMessageId
-[ ] T5.20  POST /messages/send/text + /messages/send/template
+[x] T5.19a WhatsAppService.sendTextMessage
+[x] T5.19b WhatsAppService.sendTemplateMessage
+[x] T5.19c WhatsAppService.sendImageMessage
+[x] T5.19d Shared sendMessage HTTP path
+[x] T5.19e extractMessageId
+[x] T5.20  POST /messages/send/text + /messages/send/template
 [ ] T5.21  Retire /admin/queues Bull-Board when queue substrate moves; asynqmon replacement + basic auth
 [ ] T5.22  Cut /webhooks/* and /messages/* to Go
 [ ] T5.23  Watch 24h with webhook error-rate alert before proceeding
@@ -335,26 +335,26 @@ outbound-queue deferred to Stage 8c (its producers span Stages 7-8). Rollback: p
 re-point producer at BullMQ; Node worker stays deployable through this stage and Stage 7.
 ========================================================================
 
-[ ] T6.1   Per-queue drain runbook (pause producer -> confirm drained -> deploy both sides -> resume); rehearsed staging
-[ ] T6.2   asynq runtime: Redis conn, worker mux, cmd/worker graceful shutdown
-[ ] T6.3   Map job options per queue (B.2 table): MaxRetry, exp backoff, retention, rate limiter middleware
+[x] T6.1   Per-queue drain runbook (pause producer -> confirm drained -> deploy both sides -> resume); rehearsed staging
+[x] T6.2   asynq runtime: Redis conn, worker mux, cmd/worker graceful shutdown
+[x] T6.3   Map job options per queue (B.2 table): MaxRetry, exp backoff, retention, rate limiter middleware
            (100/10s webhook, 50/1s outbound+CRM, 20/1s payments, 10/1s follow-up)
-[ ] T6.4   EXPLICIT failure-event registration + test that failure handler actually fires (Nest @OnQueueEvent lesson)
-[ ] T6.5   Permanent-failure path: fatal log w/ real stack -> Sentry once retries exhausted
-[ ] T6.6   Per-stage error context helper (runStage equivalent from crm-materialiser.processor.ts)
-[ ] T6.7   recover() safety nets in worker goroutines (unhandledRejection/uncaughtException equivalents)
-[ ] T6.8   go-worker in docker-compose.yml + deploy script
-[ ] T6.9   asynqmon up w/ basic auth (replaces Bull-Board, per T5.21)
+[x] T6.4   EXPLICIT failure-event registration + test that failure handler actually fires (Nest @OnQueueEvent lesson)
+[x] T6.5   Permanent-failure path: fatal log w/ real stack -> Sentry once retries exhausted
+[x] T6.6   Per-stage error context helper (runStage equivalent from crm-materialiser.processor.ts)
+[x] T6.7   recover() safety nets in worker goroutines (unhandledRejection/uncaughtException equivalents)
+[x] T6.8   go-worker in docker-compose.yml + deploy script
+[x] T6.9   asynqmon up w/ basic auth (replaces Bull-Board, per T5.21)
 -- embedding --
-[ ] T6.15  EmbeddingService.buildSearchDocument — IDENTICAL text assembly (changes alter every vector silently)
-[ ] T6.16  generateEmbedding: text-embedding-3-small @ 768 dims, dimension-reduction param passed identically
-[ ] T6.17  embedProduct + raw-SQL vector write
-[ ] T6.18  embedAllForBusiness bulk path + partial-failure reporting
-[ ] T6.19  ImageEmbeddingService: generateImageEmbedding(+FromUrl), embedProductImageRow(s), findSimilarProductsByImage
-[ ] T6.20  embedding.processor job-name switch (embed-product, embed-product-image) + unknown-type error
-[ ] T6.21  Vector PARITY test: same corpus through both stacks, vectors match full precision
-[ ] T6.22  Retrieval quality: fixed queries through semanticProductSearch both stacks, ranked results compared
-[ ] T6.23  Drain-and-cut embedding; retire T4.1 bridge if used
+[x] T6.15  EmbeddingService.buildSearchDocument — IDENTICAL text assembly (changes alter every vector silently)
+[x] T6.16  generateEmbedding: text-embedding-3-small @ 768 dims, dimension-reduction param passed identically
+[x] T6.17  embedProduct + raw-SQL vector write
+[x] T6.18  embedAllForBusiness bulk path + partial-failure reporting
+[x] T6.19  ImageEmbeddingService: generateImageEmbedding(+FromUrl), embedProductImageRow(s), findSimilarProductsByImage
+[x] T6.20  embedding.processor job-name switch (embed-product, embed-product-image) + unknown-type error
+[x] T6.21 Vector PARITY: BIT-EXACT (768/768 Float32bits identical Node-worker vs Go-handler against same DB + same OpenAI stub; search-doc assembly byte-ported incl JS-trim quirks)
+[~] T6.22 Retrieval quality: distance-threshold query shape verified on seeded vectors; full ranked-results comparison lands with S8 catalog port
+[~] T6.23 Drain-and-cut embedding (OPERATIONAL — drain runbook applies at cutover)
 
 ========================================================================
 STAGE 7 — BUSINESS-LOGIC WORKERS AND CRONS (highest financial risk)
@@ -363,52 +363,52 @@ payment errors NOT route-revertible — document + rehearse manual reconciliatio
 ========================================================================
 
 -- payment-events --
-[ ] T7.1   Idempotency check on Payment.externalReference
-[ ] T7.2   Strategy A: match by reference = order.id
-[ ] T7.3   Strategy B fallback: customer phone + amount (incl ambiguity/no-match handling)
-[ ] T7.4   Payment creation, all 17 fields incl rawWebhookPayload preservation
-[ ] T7.5   Order status transition on successful payment
-[ ] T7.6   Customer payment-confirmation WhatsApp message
-[ ] T7.7   Validate vs T0.11; reconcile one week of real payments across both stacks
+[x] T7.1   Idempotency check on Payment.externalReference
+[x] T7.2   Strategy A: match by reference = order.id
+[x] T7.3   Strategy B fallback: customer phone + amount (incl ambiguity/no-match handling)
+[x] T7.4   Payment creation, all 17 fields incl rawWebhookPayload preservation
+[x] T7.5   Order status transition on successful payment
+[x] T7.6   Customer payment-confirmation WhatsApp message
+[~] T7.7   Characterization assertions complete (Strategy A/B/ambiguity/dup); the ONE-WEEK REAL reconciliation is operational at cutover
 [ ] T7.8   Drain-and-cut payment-events
 
 -- crm-materialiser + handlers --
-[ ] T7.9   CustomerCaptureHandler.updateCustomerName
-[ ] T7.10  ProfileBuilderHandler: preference accumulation (case-insensitive dedup, cap 50), delivery-area latest-wins, sentiment change-only
-[ ] T7.11  Profile-missing defensive create path
-[ ] T7.12  OrderLedgerHandler short-ID resolution: hex validation, escapeLikePattern, LIKE prefix scoped businessId+is_available
-[ ] T7.13  Price snapshotting into OrderItem (ledger immutability) + Decimal totals
-[ ] T7.14  Order tx: create w/ idempotencyKey, OrderItem.createMany, P2002 duplicate-skip
-[ ] T7.15a Atomic conditional stock decrement in SQLC (per-product qty aggregation for duplicate line items)
-[ ] T7.15b Oversell guard: affected rows != expected -> rollback (sqlc catches text=uuid class at build time)
-[ ] T7.16  InsufficientStockError rollback semantics + warn-level log
-[ ] T7.17  updateProfileStats: totalOrders, totalSpent, averageOrderValue, lastOrderAt, orderFrequencyDays
-[ ] T7.18  Payment link gen + per-currency paymentMethods copy from CURRENCY_CONFIG (brand never named)
-[ ] T7.19  INVOICING transition w/ CAS guard + ESCALATED/INVOICING skip conditions
-[ ] T7.20  Durable follow-up scheduling (abandoned-cart +2h, unpaid-invoice-first +24h) via ScheduledFollowUp.createMany
-[ ] T7.21  Stage-level error context wrapper + failure logging
+[x] T7.9   CustomerCaptureHandler.updateCustomerName
+[x] T7.10  ProfileBuilderHandler: preference accumulation (case-insensitive dedup, cap 50), delivery-area latest-wins, sentiment change-only
+[x] T7.11  Profile-missing defensive create path
+[x] T7.12  OrderLedgerHandler short-ID resolution: hex validation, escapeLikePattern, LIKE prefix scoped businessId+is_available
+[x] T7.13  Price snapshotting into OrderItem (ledger immutability) + Decimal totals
+[x] T7.14  Order tx: create w/ idempotencyKey, OrderItem.createMany, P2002 duplicate-skip
+[x] T7.15a Atomic conditional stock decrement in SQLC (per-product qty aggregation for duplicate line items)
+[x] T7.15b Oversell guard: affected rows != expected -> rollback (sqlc catches text=uuid class at build time)
+[x] T7.16  InsufficientStockError rollback semantics + warn-level log
+[x] T7.17  updateProfileStats: totalOrders, totalSpent, averageOrderValue, lastOrderAt, orderFrequencyDays
+[x] T7.18  Payment link gen + per-currency paymentMethods copy from CURRENCY_CONFIG (brand never named)
+[x] T7.19  INVOICING transition w/ CAS guard + ESCALATED/INVOICING skip conditions
+[x] T7.20  Durable follow-up scheduling (abandoned-cart +2h, unpaid-invoice-first +24h) via ScheduledFollowUp.createMany
+[x] T7.21  Stage-level error context wrapper + failure logging
 [ ] T7.22  Drain-and-cut crm-materialiser
 
 -- follow-up + crons --
-[ ] T7.23a follow-up job: abandoned-cart (exact copy + currency formatting)
-[ ] T7.23b follow-up job: unpaid-invoice-first
-[ ] T7.23c follow-up job: unpaid-invoice-second
-[ ] T7.23d follow-up job: delivery-confirmation
-[ ] T7.23e follow-up job: re-engagement
-[ ] T7.24  Relevance re-check (skip if order since paid/cancelled)
-[ ] T7.25a follow-up-scanner */1 * * * *: due-row query
-[ ] T7.25b Scanner take:50 cap
-[ ] T7.25c Scanner CAS claim (executedAt null, cancelledAt null) preventing double-send
-[ ] T7.26a outbox-sweep */2 * * * *: stranded pending messages, take:100
-[ ] T7.26b Sweep re-enqueue + failed_stale marking (survives because asynq has no transactional enqueue)
-[ ] T7.27  retention-scanner 0 9 * * *: orderFrequencyDays threshold multiplier + re-engagement enqueue
-[ ] T7.28a Cron singleton: Postgres advisory lock (asynq has no leader election for periodic jobs)
-[ ] T7.28b Two-instance test proving no double-fire
-[ ] T7.29  ConversationStateService.transition: VALID_TRANSITIONS table, illegal rejection, CAS stale-state rejection (vs T0.12)
-[ ] T7.30  safety.guard.requiresEscalation keyword matching
-[ ] T7.31  Drain-and-cut follow-up; move 3 crons in ONE deploy
+[x] T7.23a follow-up job: abandoned-cart (exact copy + currency formatting)
+[x] T7.23b follow-up job: unpaid-invoice-first
+[x] T7.23c follow-up job: unpaid-invoice-second
+[x] T7.23d follow-up job: delivery-confirmation
+[x] T7.23e follow-up job: re-engagement
+[x] T7.24  Relevance re-check (skip if order since paid/cancelled)
+[x] T7.25a follow-up-scanner */1 * * * *: due-row query
+[x] T7.25b Scanner take:50 cap
+[x] T7.25c Scanner CAS claim (executedAt null, cancelledAt null) preventing double-send
+[x] T7.26a outbox-sweep */2 * * * *: stranded pending messages, take:100
+[x] T7.26b Sweep re-enqueue + failed_stale marking (survives because asynq has no transactional enqueue)
+[x] T7.27  retention-scanner 0 9 * * *: orderFrequencyDays threshold multiplier + re-engagement enqueue
+[x] T7.28a Cron singleton: Postgres advisory lock (asynq has no leader election for periodic jobs)
+[x] T7.28b Two-instance test proving no double-fire
+[x] T7.29  ConversationStateService.transition: VALID_TRANSITIONS table, illegal rejection, CAS stale-state rejection (vs T0.12)
+[x] T7.30  safety.guard.requiresEscalation keyword matching
+[~] T7.31 Crons implemented as asynq periodic tasks + advisory locks; single-deploy cutover is operational
 [ ] T7.32  Delete example-queue + example.processor (dead code)
-[ ] T7.33  Full week orders+payments reconciled across stacks before stage done
+[~] T7.33 Week-long real-data reconciliation = operational cutover activity
 
 ========================================================================
 STAGE 8 — MEASUREMENT GATE, ORCHESTRATOR PORT, FINAL QUEUE CONSOLIDATION

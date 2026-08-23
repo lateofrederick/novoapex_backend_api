@@ -15,6 +15,10 @@ import (
 	"github.com/novoapex/novoapex-backend-api/internal/auth"
 	"github.com/novoapex/novoapex-backend-api/internal/config"
 	"github.com/novoapex/novoapex-backend-api/internal/db"
+	"github.com/novoapex/novoapex-backend-api/internal/queue"
+
+	"net"
+
 	"github.com/novoapex/novoapex-backend-api/internal/handlers"
 	"github.com/novoapex/novoapex-backend-api/internal/httpx"
 	"github.com/novoapex/novoapex-backend-api/internal/integrations/paystack"
@@ -85,6 +89,25 @@ func main() {
 		WhatsApp:   waSender{c: waClient},
 		WhatsAppID: cfg.WhatsAppPhoneNumberID,
 	}
+	qclient := queue.NewClientWithLogger(net.JoinHostPort(cfg.RedisHost, strconv.Itoa(cfg.RedisPort)), cfg.RedisPassword, logger)
+	defer func() { _ = qclient.Close() }()
+
+	kernel.Router.Group(func(pub chi.Router) {
+		handlers.MountWebhooks(pub, handlers.WebhookDeps{
+			Pool:           pool,
+			Publisher:      qclient,
+			AppSecret:      cfg.WhatsAppAppSecret,
+			VerifyToken:    cfg.WhatsAppVerifyToken,
+			PaystackSecret: cfg.PaystackSecretKey,
+		})
+		pub.Route("/messages", func(m chi.Router) {
+			handlers.MountMessages(m, handlers.MessagesDeps{
+				WA:            waClient,
+				PhoneNumberID: cfg.WhatsAppPhoneNumberID,
+			})
+		})
+	})
+
 	kernel.Router.Route("/auth", func(a chi.Router) {
 		a.Use(auth.Middleware(cfg.JWTSecret, func(r *http.Request) bool {
 			if r.Method != http.MethodPost {

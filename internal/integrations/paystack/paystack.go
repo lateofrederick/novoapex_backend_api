@@ -24,13 +24,21 @@ package paystack
 import (
 	"bytes"
 	"context"
+	"crypto/hmac"
+	"crypto/sha512"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"strings"
 	"time"
+
+	"github.com/shopspring/decimal"
+
+	"github.com/novoapex/novoapex-backend-api/internal/money"
 )
 
 // DefaultBaseURL is the production Paystack API root; override via Config for
@@ -158,6 +166,133 @@ func (c *Client) InitiateTransfer(ctx context.Context, req TransferRequest) (Tra
 		return TransferResult{}, err
 	}
 	return TransferResult{Status: out.Status, TransferCode: out.TransferCode}, nil
+}
+
+// VerifyWebhookSignature ports PaystackProvider.verifyWebhookSignature
+// (paystack.provider.ts:41-61): HMAC-SHA512 hex digest of the RAW body under
+// the secret key, compared constant-time against the x-paystack-signature
+// header value. An empty secret always fails (the source logs
+// "PAYSTACK_SECRET_KEY is not configured — cannot verify webhook" and returns
+// false — logging stays at the adapter layer so this stays pure).
+func VerifyWebhookSignature(secret string, body []byte, signature string) bool {
+	if strings.TrimSpace(secret) == "" {
+		return false
+	}
+	mac := hmac.New(sha512.New, []byte(secret))
+	mac.Write(body)
+	expected := hex.EncodeToString(mac.Sum(nil))
+
+	// timingSafeEqual requires equal-length buffers; the source pre-checks
+	// (paystack.provider.ts:57-59) and so do we.
+	if len(expected) != len(signature) {
+		return false
+	}
+	return hmac.Equal([]byte(expected), []byte(signature))
+}
+
+// InitiatePaymentRequest carries the /transaction/initialize parameters,
+// mirroring InitiatePaymentParams. AmountMajor is MAJOR units as an exact
+// decimal; the single minor-unit conversion happens below via
+// money.ToMinorUnits (never a float), replacing the source's
+// Math.round(params.amount * 100).
+type InitiatePaymentRequest struct {
+	AmountMajor   decimal.Decimal
+	Currency      string
+	CustomerEmail string // optional; falls back to <digits(customerPhone)>@customers.novoapex.com
+	CustomerPhone string
+	Reference     string
+	BusinessID    string
+	CallbackURL   string
+}
+
+// InitiatePaymentResult mirrors InitiatePaymentResult: failures are reported
+// as Status "failed", NOT as errors (the source never throws out of
+// initiatePayment — paystack.provider.ts:144-196).
+type InitiatePaymentResult struct {
+	Status            string // "initiated" | "failed"
+	PaymentURL        string // data.authorization_url
+	ProviderReference string // data.reference ?? params.reference
+}
+
+const customerEmailFallbackDomain = "@customers.novoapex.com"
+
+// InitiatePayment POSTs ${BaseURL}/transaction/initialize to create a pending
+// transaction and returns the authorization URL the customer completes
+// payment at (paystack.provider.ts:144-196). Wire contract:
+//
+//	body {amount:<minor units>, currency, email, reference, callback_url,
+//	      metadata:{customer_phone, businessId}}
+//	ok  -> data{authorization_url, access_code, reference}, status "initiated"
+//	any API/transport/secret failure -> {status:"failed"}, nil error
+func (c *Client) InitiatePayment(ctx context.Context, req InitiatePaymentRequest) (InitiatePaymentResult, error) {
+	if strings.TrimSpace(c.cfg.SecretKey) == "" {
+		slog.Error("PAYSTACK_SECRET_KEY is not configured — cannot initiate payment")
+		return InitiatePaymentResult{Status: "failed"}, nil
+	}
+
+	email := req.CustomerEmail
+	if email == "" {
+		// Paystack REQUIRES an email: non-personal per-customer placeholder on
+		// a non-delivering subdomain (paystack.provider.ts:164-168).
+		digits := strings.Map(func(r rune) rune {
+			if r >= '0' && r <= '9' {
+				return r
+			}
+			return -1
+		}, req.CustomerPhone)
+		if digits == "" {
+			digits = "unknown"
+		}
+		email = digits + customerEmailFallbackDomain
+	}
+
+	var out struct {
+		AuthorizationURL string `json:"authorization_url"`
+		AccessCode       string `json:"access_code"`
+		Reference        string `json:"reference"`
+	}
+	err := c.do(ctx, "/transaction/initialize", wireInitialize{
+		Amount:      money.ToMinorUnits(req.AmountMajor),
+		Currency:    req.Currency,
+		Email:       email,
+		Reference:   req.Reference,
+		CallbackURL: req.CallbackURL,
+		Metadata: wireInitMetadata{
+			CustomerPhone: req.CustomerPhone,
+			BusinessID:    req.BusinessID,
+		},
+	}, &out)
+	if err != nil {
+		slog.Error(fmt.Sprintf("Paystack initiation failed: %v", err))
+		return InitiatePaymentResult{Status: "failed"}, nil
+	}
+
+	ref := out.Reference
+	if ref == "" {
+		ref = req.Reference
+	}
+	return InitiatePaymentResult{
+		Status:            "initiated",
+		PaymentURL:        out.AuthorizationURL,
+		ProviderReference: ref,
+	}, nil
+}
+
+// wireInitialize preserves the source body shape exactly; callback_url and
+// both metadata keys are ALWAYS serialised (even empty), matching
+// JSON.stringify of paystack.provider.ts:160-177.
+type wireInitialize struct {
+	Amount      int64            `json:"amount"`
+	Currency    string           `json:"currency"`
+	Email       string           `json:"email"`
+	Reference   string           `json:"reference"`
+	CallbackURL string           `json:"callback_url"`
+	Metadata    wireInitMetadata `json:"metadata"`
+}
+
+type wireInitMetadata struct {
+	CustomerPhone string `json:"customer_phone"`
+	BusinessID    string `json:"businessId"`
 }
 
 // envelope is the universal Paystack response shape {status, message, data}.
