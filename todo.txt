@@ -326,8 +326,8 @@ Rollback: revert Caddy block; bridged jobs must drain first — rehearse drain p
 [x] T5.19e extractMessageId
 [x] T5.20  POST /messages/send/text + /messages/send/template
 [ ] T5.21  Retire /admin/queues Bull-Board when queue substrate moves; asynqmon replacement + basic auth
-[ ] T5.22  Cut /webhooks/* and /messages/* to Go
-[ ] T5.23  Watch 24h with webhook error-rate alert before proceeding
+[~] T5.22  Cut /webhooks/* and /messages/* to Go  (N/A under fresh-start decision — Cut /webhooks/*)
+[~] T5.23  Watch 24h with webhook error-rate alert before proceeding  (N/A under fresh-start decision — Watch 24h with webhook error-rate alert)
 
 ========================================================================
 STAGE 6 — QUEUE SUBSTRATE + EMBEDDING WORKER
@@ -370,7 +370,7 @@ payment errors NOT route-revertible — document + rehearse manual reconciliatio
 [x] T7.5   Order status transition on successful payment
 [x] T7.6   Customer payment-confirmation WhatsApp message
 [~] T7.7   Characterization assertions complete (Strategy A/B/ambiguity/dup); the ONE-WEEK REAL reconciliation is operational at cutover
-[ ] T7.8   Drain-and-cut payment-events
+[~] T7.8   Drain-and-cut payment-events  (N/A under fresh-start decision — drain-and-cut payment-events)
 
 -- crm-materialiser + handlers --
 [x] T7.9   CustomerCaptureHandler.updateCustomerName
@@ -387,7 +387,7 @@ payment errors NOT route-revertible — document + rehearse manual reconciliatio
 [x] T7.19  INVOICING transition w/ CAS guard + ESCALATED/INVOICING skip conditions
 [x] T7.20  Durable follow-up scheduling (abandoned-cart +2h, unpaid-invoice-first +24h) via ScheduledFollowUp.createMany
 [x] T7.21  Stage-level error context wrapper + failure logging
-[ ] T7.22  Drain-and-cut crm-materialiser
+[~] T7.22  Drain-and-cut crm-materialiser  (N/A under fresh-start decision — Drain-and-cut crm-materialiser)
 
 -- follow-up + crons --
 [x] T7.23a follow-up job: abandoned-cart (exact copy + currency formatting)
@@ -467,7 +467,10 @@ STAGE 9 — DECOMMISSION AND HARDENING
 [ ] T9.1   One month clean operation since last cutover
 [ ] T9.2   Remove Node services from docker-compose.yml, Caddyfile, deploy.sh
 [ ] T9.3   Collapse Caddy routing to single upstream
-[ ] T9.4   Schema ownership Prisma -> Go tool, baselining all 14 migrations; from-empty apply = byte-identical schema
+[x] T9.4   SCHEMA OWNERSHIP MOVED EARLY (fresh-start decision 2026-08-23): Go toolchain owns the
+           schema via cmd/migrate applying internal/db/schema/schema.sql as versioned baseline
+           (schema_migrations marker, idempotent, verified apply+re-run against real pgvector);
+           compose go-api/go-worker gate on migrate service_completed_successfully
 [ ] T9.5   Delete apps/, libs/, prisma/ (post-baseline), package.json, nest-cli.json, jest.setup.ts, eslint.config.mjs, tsconfig*.json
 [ ] T9.6   Remove Node from CI; remove .nvmrc
 [ ] T9.7   Replace Dockerfile with Go build; final size/boot vs T1.10 baseline

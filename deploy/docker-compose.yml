@@ -45,6 +45,8 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
     environment:
       - NODE_ENV=production
       - PORT=3100
@@ -91,6 +93,8 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
     environment:
       - NODE_ENV=production
       - DATABASE_URL=postgresql://postgres:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}@db:5432/novoapex?schema=public
@@ -181,16 +185,16 @@ services:
       retries: 12
 
   migrate:
-    profiles:
-      - migrate
-    image: node:22-alpine
+    build:
+      context: ..
+      dockerfile: migrate.Dockerfile
     container_name: novoapex_go_migrate
-    working_dir: /work
-    volumes:
-      - ../../novoapex/prisma:/work/prisma:ro
+    restart: "no"
+    depends_on:
+      db:
+        condition: service_healthy
     environment:
       - DATABASE_URL=postgresql://postgres:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}@db:5432/novoapex?schema=public
-    entrypoint: sh -c 'npm exec -y prisma@6 -- migrate deploy --schema /work/prisma/schema.prisma'
 
 volumes:
   postgres_data:

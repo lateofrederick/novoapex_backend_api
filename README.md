@@ -50,7 +50,7 @@ containers, no dependency on the novoapex checkout at runtime:
 cd deploy
 cp .env.example .env      # fill in secrets + DOMAIN
 ./deploy.sh up            # build + start caddy/go-api/go-worker/db/redis/asynqmon
-./deploy.sh migrate       # apply prisma migrations (needs ../novoapex checkout; until Stage 9)
+./deploy.sh migrate       # apply schema baseline (idempotent; auto-runs before api/worker)
 ./deploy.sh roll          # rebuild+restart api and worker only
 ```
 

@@ -18,7 +18,7 @@ Commands:
   down      Stop the stack (data volumes preserved)
   status    Service states + health
   logs      Follow logs for a service: ./deploy.sh logs go-api
-  migrate   Apply prisma migrations (needs a novoapex checkout sibling; see README)
+  migrate   Apply schema baseline (no-op when already applied)
   health    Curl the api health endpoints through caddy
 
 Rollback to the Node stack is documented in novoapex/docs/rollback-go-cutover.md.
@@ -60,7 +60,7 @@ case "${1:-}" in
     ;;
   migrate)
     need_env
-    compose --profile migrate run --rm migrate
+    compose up --build migrate
     ;;
   health)
     echo "go-api /health/live:"
