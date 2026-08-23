@@ -416,42 +416,42 @@ Port is COMMITTED (ADR 0002). 8a sizes/schedules, does not decide whether.
 ========================================================================
 
 -- 8a measurement gate --
-[ ] T8.1   Measure vs Stage 1 baseline: cost, p50/p99, incidents, deploy freq, feature lead time
-[ ] T8.2   Assess whether remaining Node causes operational problems (sequencing input, not go/no-go)
-[ ] T8.3   Estimate 8b at current velocity incl structured-output work
+[x] T8.1   Measure vs Stage 1 baseline: cost, p50/p99, incidents, deploy freq, feature lead time
+[x] T8.2   Assess whether remaining Node causes operational problems (sequencing input, not go/no-go)
+[x] T8.3   Estimate 8b at current velocity incl structured-output work
 
 -- 8b orchestrator port --
-[ ] T8.5   CatalogRetrieverService.getContextForBusiness (image-supplied branch)
-[ ] T8.6   semanticProductSearch: embed msg, (embedding <=> $2::vector) < 0.8, LIMIT 5, has_image EXISTS
-[ ] T8.7   formatProduct: short IDs, currency locale, stock suffix >0 only, [HAS_IMAGE], description handling
-[ ] T8.8   getFullCatalog + "showing X most relevant of Y+" header
-[ ] T8.9   searchFaqs + POLICIES & FAQs section
-[ ] T8.10  getImageMatchContext + IMAGE MATCH section w/ percentage scores
-[ ] T8.11  System prompt VERBATIM incl ${paymentMethods}/${conversationState} injection points
-[ ] T8.12a LlmResponseSchema -> Go JSON-schema, field descriptions preserved verbatim (load-bearing prompt text)
-[ ] T8.12b CrmSignalsSchema -> Go JSON-schema
-[ ] T8.13a Structured output: JSON-schema generation for both providers
-[ ] T8.13b Structured output: native structured-output mode calls
-[ ] T8.13c Structured output: response validation
-[ ] T8.13d Structured output: malformed-response retry path
-[ ] T8.14  Multimodal assembly (customer image on last user turn)
-[ ] T8.15  WhatsAppMediaService.downloadMedia + 10MB audio escalation threshold
-[ ] T8.16  AudioTranscriptionService.transcribe
-[ ] T8.17  fetchConversationHistory: last 10+10 merged, time-sorted, empty-filtered, sliced 10
-[ ] T8.18  resolveConversationContext: customer upsert + nested profile create, conversation upsert, lastContactAt bump
-[ ] T8.19  enforceSafetyGuardrails: escalation short-circuit + keyword match
-[ ] T8.20  Low-confidence escalation (< 0.7 internal_confidence)
-[ ] T8.21  getAlreadyShownProducts/buildShownImagesContext/gateProductImageIds (gating on explicit request NOT send history)
-[ ] T8.22  sendProductImages/enqueueOutboundImageMessage incl productId persistence + 24h branch
-[ ] T8.23  24h window compliance check in enqueueOutboundMessage
-[ ] T8.24  Intent-driven transitions (checkout_request, product_inquiry, image_match, support_faq, complaint) + source guards
-[ ] T8.25  CRM signal emission to crm-materialiser, non-blocking swallow-and-log
-[ ] T8.26  DESIGN debounce equivalent for asynq (today: fixed jobId + 3s delay collapsing rapid msgs into one LLM call)
-[ ] T8.27  Completion re-check closing debounce drop-window
-[ ] T8.28a Golden-transcript harness player (recorded conversations through both stacks)
-[ ] T8.28b Decision differ: intent/state/images-sent/CRM signals/order confirmation (reply wording may differ, decisions must not)
-[ ] T8.29  Shadow run 2 weeks: Go computes+logs, Node reply ships; continuous diff
-[ ] T8.30  Cost check: tokens/conversation flat or better
+[x] T8.5   CatalogRetrieverService.getContextForBusiness (image-supplied branch)
+[x] T8.6   semanticProductSearch: embed msg, (embedding <=> $2::vector) < 0.8, LIMIT 5, has_image EXISTS
+[x] T8.7   formatProduct: short IDs, currency locale, stock suffix >0 only, [HAS_IMAGE], description handling
+[x] T8.8   getFullCatalog + "showing X most relevant of Y+" header
+[x] T8.9   searchFaqs + POLICIES & FAQs section
+[x] T8.10  getImageMatchContext + IMAGE MATCH section w/ percentage scores
+[x] T8.11  System prompt VERBATIM incl ${paymentMethods}/${conversationState} injection points
+[x] T8.12a LlmResponseSchema -> Go JSON-schema, field descriptions preserved verbatim (load-bearing prompt text)
+[x] T8.12b CrmSignalsSchema -> Go JSON-schema
+[x] T8.13a Structured output: JSON-schema generation for both providers
+[x] T8.13b Structured output: native structured-output mode calls
+[x] T8.13c Structured output: response validation
+[x] T8.13d Structured output: malformed-response retry path
+[x] T8.14  Multimodal assembly (customer image on last user turn)
+[x] T8.15  WhatsAppMediaService.downloadMedia + 10MB audio escalation threshold
+[x] T8.16  AudioTranscriptionService.transcribe
+[x] T8.17  fetchConversationHistory: last 10+10 merged, time-sorted, empty-filtered, sliced 10
+[x] T8.18  resolveConversationContext: customer upsert + nested profile create, conversation upsert, lastContactAt bump
+[x] T8.19  enforceSafetyGuardrails: escalation short-circuit + keyword match
+[x] T8.20  Low-confidence escalation (< 0.7 internal_confidence)
+[x] T8.21  getAlreadyShownProducts/buildShownImagesContext/gateProductImageIds (gating on explicit request NOT send history)
+[x] T8.22  sendProductImages/enqueueOutboundImageMessage incl productId persistence + 24h branch
+[x] T8.23  24h window compliance check in enqueueOutboundMessage
+[x] T8.24  Intent-driven transitions (checkout_request, product_inquiry, image_match, support_faq, complaint) + source guards
+[x] T8.25  CRM signal emission to crm-materialiser, non-blocking swallow-and-log
+[x] T8.26  DESIGN debounce equivalent for asynq (today: fixed jobId + 3s delay collapsing rapid msgs into one LLM call)
+[x] T8.27  Completion re-check closing debounce drop-window
+[x] T8.28a Golden-transcript harness player (recorded conversations through both stacks)
+[x] T8.28b Decision differ: intent/state/images-sent/CRM signals/order confirmation (reply wording may differ, decisions must not)
+[~] T8.29  Shadow run 2 weeks (OPERATIONAL — machinery ready: transcript harness + decision vectors): Go computes+logs, Node reply ships; continuous diff
+[~] T8.30  TokenUsage capture shipped in ResponsesLLM; the flat-or-better verdict is measured during the shadow run
 [ ] T8.31  Cutover; Node orchestrator deployable one full month
 
 -- 8c final queue consolidation --

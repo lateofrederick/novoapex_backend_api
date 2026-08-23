@@ -11,6 +11,7 @@ package main
 import (
 	"context"
 	"crypto/tls"
+	"encoding/base64"
 	"fmt"
 	"log/slog"
 	"net"
@@ -27,6 +28,7 @@ import (
 	"github.com/novoapex/novoapex-backend-api/internal/integrations/openai"
 	"github.com/novoapex/novoapex-backend-api/internal/integrations/paystack"
 	"github.com/novoapex/novoapex-backend-api/internal/integrations/whatsapp"
+	"github.com/novoapex/novoapex-backend-api/internal/orchestrator"
 	"github.com/novoapex/novoapex-backend-api/internal/queue"
 	"github.com/novoapex/novoapex-backend-api/internal/workers"
 )
@@ -111,12 +113,20 @@ func main() {
 		})
 	}
 
-	// Placeholder orchestrator-queue consumer (Stage 8 will replace it): log
-	// and ack so asynq-side orchestrator tasks never pile up unprocessed.
-	server.Register(queue.TaskOrchestratorDebounce, func(ctx context.Context, payload []byte) error {
-		logger.Info("orchestrator task acknowledged by placeholder consumer",
-			slog.Int("payload_bytes", len(payload)))
-		return nil
+	// Stage 8 orchestrator consumer.
+	llmClient := orchestrator.NewResponsesLLM(orchestrator.LLMConfig{
+		APIKey:  cfg.OpenAIAPIKey,
+		BaseURL: os.Getenv("OPENAI_BASE_URL"),
+	})
+	embedClient := openai.New(openai.Config{APIKey: cfg.OpenAIAPIKey, BaseURL: os.Getenv("OPENAI_BASE_URL")})
+	gemini := google.New(google.Config{APIKey: cfg.GoogleGenerativeAIAPIKey, BaseURL: os.Getenv("GOOGLE_GENERATIVE_AI_BASE_URL")})
+	workers.RegisterOrchestrator(server, workers.OrchestratorDeps{
+		Pool:      pool,
+		Publisher: client,
+		LLM:       llmClient,
+		Catalog: orchestrator.CatalogAdapter(orchestrator.RetrieverDeps{Pool: pool, OpenAI: embedClient}, func(ctx context.Context, image []byte, mimeType string) ([]float32, error) {
+			return gemini.EmbedContent(ctx, "gemini-embedding-001", 768, []google.Part{{InlineData: &google.InlineData{MimeType: mimeType, Data: base64.StdEncoding.EncodeToString(image)}}})
+		}),
 	})
 
 	sched := asynq.NewScheduler(asynq.RedisClientOpt{
