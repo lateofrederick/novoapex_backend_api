@@ -22,11 +22,15 @@ type Kernel struct {
 	shuttingDown atomic.Bool
 }
 
-func New() *Kernel {
+// New builds the kernel. Extra middlewares (error tracking and tracing) run
+// inside the base stack, so the recoverer still answers a panic they re-raise.
+func New(extra ...func(http.Handler) http.Handler) *Kernel {
 	r := chi.NewRouter()
 	r.Use(middleware.RequestID)
 	r.Use(middleware.RealIP) //nolint:staticcheck // mandated parity with Express app.set('trust proxy', 1)
+	r.Use(RequestLogger)
 	r.Use(middleware.Recoverer)
+	r.Use(extra...)
 
 	// /metrics passthrough: Prometheus exposition endpoint.
 	r.Method(http.MethodGet, "/metrics", metrics.Handler())

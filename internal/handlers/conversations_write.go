@@ -2,11 +2,10 @@ package handlers
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
-	"fmt"
 	"log/slog"
 	"net/http"
-	"time"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/jackc/pgx/v5"
@@ -15,6 +14,7 @@ import (
 
 	"github.com/novoapex/novoapex-backend-api/internal/db/gen"
 	"github.com/novoapex/novoapex-backend-api/internal/httpx"
+	"github.com/novoapex/novoapex-backend-api/internal/outbound"
 )
 
 // Conversation writes port apps/mobile-api/src/conversations (T4.18-T4.20):
@@ -24,48 +24,18 @@ import (
 // Mount: chi r.Route("/conversations", func(r chi.Router) {
 // MountConversationsWrite(r, deps); r.Mount("/", handlers.NewConversations(pool)) }).
 
-// OutboundPublisher is the queue seam behind T4.20/T4.1 + ADR 0001
-// (docs/adr/0001-queue-substrate.md): the handler ALWAYS persists the
-// outbound_messages row first, then hands the row's id to the publisher —
-// the exact ordering of enqueueOutboundMessage
-// (conversation-orchestrator.service.ts:59-78: outboundMessage.create ->
-// outboundQueue.add('send-message', {outboundMessageId})).
-//
-// HOOK POINT for the real bridge: wire an asynq/BullMQ-shim implementation of
-// this interface into ConversationsWriteDeps.Publisher at integration time.
-// Nothing else changes — the persistence contract is already the durable
-// source of truth.
-type OutboundPublisher interface {
-	PublishOutbound(ctx context.Context, outboundMessageID string) error
-}
-
-// NullPublisher is the default no-op publisher used until the queue bridge
-// ships (ADR 0001 defers it): it logs so a dropped send is visible in ops,
-// but never fails the request — the row is committed either way.
-type NullPublisher struct{}
-
-func (NullPublisher) PublishOutbound(ctx context.Context, outboundMessageID string) error {
-	slog.Warn("outbound publish skipped: no queue bridge wired (ADR 0001)",
-		"outboundMessageId", outboundMessageID)
-	return nil
-}
-
 // ConversationsWriteDeps carries the write subtree's collaborators.
 type ConversationsWriteDeps struct {
-	Pool      *pgxpool.Pool
-	Publisher OutboundPublisher // nil -> NullPublisher
+	Pool *pgxpool.Pool
+	WA   outbound.Sender // WhatsApp Cloud API client used by /reply
 }
 
 // MountConversationsWrite registers takeover/release/reply on r.
 func MountConversationsWrite(r chi.Router, d ConversationsWriteDeps) {
 	q := gen.New(d.Pool)
-	var pub OutboundPublisher = NullPublisher{}
-	if d.Publisher != nil {
-		pub = d.Publisher
-	}
 	r.Post("/{id}/takeover", conversationTakeover(q))
 	r.Post("/{id}/release", conversationRelease(q))
-	r.Post("/{id}/reply", conversationReply(q, pub))
+	r.Post("/{id}/reply", conversationReply(q, outbound.Deps{Pool: d.Pool, WA: d.WA}))
 }
 
 // conversationTakeover ports ConversationsService.takeover
@@ -127,27 +97,19 @@ func conversationRelease(q *gen.Queries) http.HandlerFunc {
 	}
 }
 
-// wo_window is the WhatsApp free-form window: 24h after the customer's newest
-// inbound message. Source constant TWENTY_FOUR_HOURS
-// (conversation-orchestrator.service.ts:40).
-const wo_window = 24 * time.Hour
-
-// conversationReply ports the vendor reply through the orchestrator's
-// characterized flow (the mobile-api reply predates the queue substrate; T4.20
-// pins the endpoint to enqueueOutboundMessage semantics,
-// conversation-orchestrator.service.ts:28-81):
+// conversationReply ports ConversationsService.reply
+// (conversations.service.ts): the vendor's message is sent to the customer
+// synchronously and the response is the persisted OutboundMessage — status
+// 'sent' with Meta's whatsappMessageId and metaResponse (201). When Meta
+// rejects the send (e.g. outside the 24-hour customer-service window) the
+// request fails with the 500 envelope and no message record remains, exactly
+// as the source, which only persisted after a successful send.
 //
-//  1. ownership probe findFirst({id, businessId}) include business -> 404
-//     'Conversation not found' on miss;
-//  2. window gate on the NEWEST inbound_messages.timestamp:
-//     within iff a row exists AND now - timestamp < 24h;
-//  3. blocked  -> persist status 'failed_24h_window_closed', raw_payload {},
-//     do NOT enqueue, still return the persisted row (201);
-//  4. allowed  -> persist status 'pending' with the WhatsApp text payload
-//     shape, then PublishOutbound(row id).
-//
-// Response bodies mirror Prisma's OutboundMessage payload key-for-key.
-func conversationReply(q *gen.Queries, pub OutboundPublisher) http.HandlerFunc {
+// Delivery goes through internal/outbound so a reply can never overtake an
+// assistant message of the same conversation that is still queued: the row is
+// written first (taking its place in the conversation's send order) and
+// delivered inline under the conversation's send lock.
+func conversationReply(q *gen.Queries, deps outbound.Deps) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		bizID, ok := ep_businessID(w, r)
 		if !ok {
@@ -174,7 +136,8 @@ func conversationReply(q *gen.Queries, pub OutboundPublisher) http.HandlerFunc {
 			return
 		}
 
-		conv, err := q.GetConversationWithBusiness(r.Context(), gen.GetConversationWithBusinessParams{
+		ctx := r.Context()
+		conv, err := q.GetConversationWithBusiness(ctx, gen.GetConversationWithBusinessParams{
 			ID:         chi.URLParam(r, "id"),
 			BusinessID: bizID,
 		})
@@ -187,32 +150,19 @@ func conversationReply(q *gen.Queries, pub OutboundPublisher) http.HandlerFunc {
 			return
 		}
 
-		withinWindow := false
-		if latest, err := q.GetLatestInboundTimestamp(r.Context(),
-			pgtype.Text{String: conv.ID, Valid: true}); err == nil && latest.Valid {
-			withinWindow = time.Since(latest.Time) < wo_window // strict <
-		} else if err != nil {
+		// rawPayload: { type: 'text', text: dto.text } (conversations.service.ts).
+		rawPayload, err := json.Marshal(map[string]string{"type": "text", "text": *body.Text})
+		if err != nil {
 			httpx.WriteError(w, r, err)
 			return
 		}
-
-		status := "pending"
-		rawPayload := []byte(fmt.Sprintf(
-			`{"messaging_product":"whatsapp","to":%q,"type":"text","text":{"body":%q}}`,
-			conv.CustomerPhone, *body.Text))
-		if !withinWindow {
-			// Compliance block (orchestrator lines 43-57): rawPayload {}.
-			status = "failed_24h_window_closed"
-			rawPayload = []byte(`{}`)
-		}
-
-		row, err := q.InsertOutboundMessage(r.Context(), gen.InsertOutboundMessageParams{
+		row, err := q.InsertOutboundMessage(ctx, gen.InsertOutboundMessageParams{
 			ID:             wo_newID(),
 			RecipientPhone: conv.CustomerPhone,
 			MessageType:    "text",
 			TextContent:    pgtype.Text{String: *body.Text, Valid: true},
 			RawPayload:     rawPayload,
-			Status:         status,
+			Status:         "pending",
 			BusinessID:     pgtype.Text{String: bizID, Valid: true},
 			ConversationID: pgtype.Text{String: conv.ID, Valid: true},
 		})
@@ -221,16 +171,41 @@ func conversationReply(q *gen.Queries, pub OutboundPublisher) http.HandlerFunc {
 			return
 		}
 
-		if withinWindow {
-			// Persist-then-publish: the row id is what travels on the queue.
-			if err := pub.PublishOutbound(r.Context(), row.ID); err != nil {
-				httpx.WriteError(w, r, err)
-				return
+		if sendErr := outbound.Deliver(ctx, deps, row.ID, true); sendErr != nil {
+			// The source threw before persisting anything; drop the record so
+			// an undelivered reply never shows in the thread or in the
+			// assistant's conversation history.
+			if _, derr := deps.Pool.Exec(context.WithoutCancel(ctx),
+				`DELETE FROM outbound_messages WHERE id = $1`, row.ID); derr != nil {
+				slog.ErrorContext(ctx, "Failed to remove undelivered vendor reply",
+					"outboundMessageId", row.ID, "error", derr.Error())
 			}
+			httpx.WriteError(w, r, sendErr)
+			return
 		}
 
-		_ = httpx.WriteJSON(w, http.StatusCreated, wo_outboundJSON(row))
+		sent, err := wo_loadOutbound(ctx, deps.Pool, row.ID)
+		if err != nil {
+			httpx.WriteError(w, r, err)
+			return
+		}
+		_ = httpx.WriteJSON(w, http.StatusCreated, wo_outboundJSON(sent))
 	}
+}
+
+// wo_loadOutbound re-reads an outbound row after delivery recorded its
+// whatsappMessageId, metaResponse and status.
+func wo_loadOutbound(ctx context.Context, pool *pgxpool.Pool, id string) (gen.InsertOutboundMessageRow, error) {
+	var row gen.InsertOutboundMessageRow
+	err := pool.QueryRow(ctx, `
+		SELECT id, whatsapp_message_id, recipient_phone, message_type, text_content,
+		       template_name, image_url, product_id, raw_payload, meta_response,
+		       status, business_id, conversation_id, created_at
+		  FROM outbound_messages WHERE id = $1`, id).Scan(
+		&row.ID, &row.WhatsappMessageID, &row.RecipientPhone, &row.MessageType, &row.TextContent,
+		&row.TemplateName, &row.ImageUrl, &row.ProductID, &row.RawPayload, &row.MetaResponse,
+		&row.Status, &row.BusinessID, &row.ConversationID, &row.CreatedAt)
+	return row, err
 }
 
 // wo_outboundJSON renders the Prisma OutboundMessage payload (same key set as

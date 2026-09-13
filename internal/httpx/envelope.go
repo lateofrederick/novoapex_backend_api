@@ -6,17 +6,10 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
-	"strings"
 	"time"
+
+	"github.com/novoapex/novoapex-backend-api/internal/errreport"
 )
-
-// SentryHook mirrors the DSN-gated global SentryFilter registration in
-// apps/api/src/main.ts:32-37. When non-nil it is invoked for captured
-// errors, except on health probe paths (sentry.filter.ts HEALTH_PATHS).
-var SentryHook func(r *http.Request, err error)
-
-// envHealthPaths reproduces libs/observability/src/sentry.filter.ts:11.
-var envHealthPaths = []string{"/health", "/health/live", "/health/ready"}
 
 // HTTPException ports NestJS HttpException: an HTTP status plus the exact
 // payload HttpException.getResponse() would return — a string, or an
@@ -73,15 +66,14 @@ func WriteError(w http.ResponseWriter, r *http.Request, err error) {
 	env_respond(w, r, err, status, message)
 }
 
-// env_respond reproduces the shared filter side effects in order:
-// optional Sentry capture (SentryFilter only), an error log line
-// (AllExceptionsFilter logger.error), then the JSON envelope.
+// env_respond reproduces the shared filter side effects in order: the
+// exception goes to error tracking when it is on (the DSN-gated SentryFilter,
+// apps/api/src/main.ts:32-37), an error log line (AllExceptionsFilter
+// logger.error), then the JSON envelope.
 func env_respond(w http.ResponseWriter, r *http.Request, err error, status int, message any) {
 	url := env_requestURL(r)
 
-	if SentryHook != nil && !env_isHealthPath(url) {
-		SentryHook(r, err)
-	}
+	errreport.Report(w, err)
 
 	slog.Error(fmt.Sprintf("%s %s %d - %s", r.Method, url, status, env_jsonString(message)))
 
@@ -102,15 +94,6 @@ func env_respond(w http.ResponseWriter, r *http.Request, err error, status int, 
 	enc := json.NewEncoder(w)
 	enc.SetEscapeHTML(false)
 	_ = enc.Encode(body)
-}
-
-func env_isHealthPath(url string) bool {
-	for _, p := range envHealthPaths {
-		if url == p || strings.HasPrefix(url, p+"/") {
-			return true
-		}
-	}
-	return false
 }
 
 func env_requestURL(r *http.Request) string {

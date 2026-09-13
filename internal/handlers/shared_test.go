@@ -22,8 +22,6 @@ import (
 	"github.com/novoapex/novoapex-backend-api/internal/harness"
 )
 
-// epTestJWTSecret is byte-identical to the harness Node stack's JWT_SECRET so
-// tokens minted here authenticate against BOTH stacks in live parity tests.
 const epTestJWTSecret = "0123456789abcdef0123456789abcdef"
 
 type epEnv struct {
@@ -34,9 +32,9 @@ type epEnv struct {
 	F    *harness.Factory
 }
 
-// ep_startTest boots the shared containers, applies the 14 prisma migrations
-// and opens both a fixture handle and a handler-facing pgx pool on the same
-// DSN (the exact wiring cmd/api uses).
+// ep_startTest boots the shared containers, applies the Go-owned baseline
+// schema and opens both a fixture handle and a handler-facing pgx pool on the
+// same DSN (the exact wiring cmd/api uses).
 func ep_startTest(t *testing.T) *epEnv {
 	t.Helper()
 	ctx := context.Background()
@@ -47,12 +45,8 @@ func ep_startTest(t *testing.T) *epEnv {
 	}
 	t.Cleanup(func() { h.Terminate(context.Background()) })
 
-	repoDir, err := harness.NovoApexRepoDir()
-	if err != nil {
-		t.Skipf("novoapex repo not reachable: %v", err)
-	}
-	if err := harness.ApplyPrismaMigrations(ctx, repoDir, h.PostgresDSN); err != nil {
-		t.Fatalf("apply migrations: %v", err)
+	if err := harness.ApplyBaselineSchema(ctx, h.PostgresDSN); err != nil {
+		t.Fatalf("apply schema: %v", err)
 	}
 
 	db, err := sql.Open("pgx", h.PostgresDSN)

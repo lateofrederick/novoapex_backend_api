@@ -11,8 +11,7 @@ import (
 func newTestFactory(t *testing.T) (*Factory, *sql.DB) {
 	t.Helper()
 	h := startHarness(t)
-	repoDir := harnessRepoDir(t)
-	applyMigrations(t, h.PostgresDSN, repoDir)
+	applyBaseline(t, h.PostgresDSN)
 
 	db, err := sql.Open("pgx", h.PostgresDSN)
 	if err != nil {

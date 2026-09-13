@@ -1,9 +1,16 @@
+// Command api serves the HTTP surface: auth, the vendor mobile API, provider
+// webhooks, manual message sends, health, metrics, API docs and the queue
+// dashboard.
+//
+// With -mobile it runs like the standalone apps/mobile-api entrypoint instead:
+// only the mobile API modules, listening on MOBILE_API_PORT.
 package main
 
 import (
 	"context"
-	"fmt"
+	"flag"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -11,30 +18,42 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/go-chi/chi/v5"
-	"github.com/novoapex/novoapex-backend-api/internal/auth"
+	"github.com/hibiken/asynq"
+	"github.com/jackc/pgx/v5"
+
 	"github.com/novoapex/novoapex-backend-api/internal/config"
 	"github.com/novoapex/novoapex-backend-api/internal/db"
-	"github.com/novoapex/novoapex-backend-api/internal/queue"
-
-	"net"
-
-	"github.com/novoapex/novoapex-backend-api/internal/handlers"
 	"github.com/novoapex/novoapex-backend-api/internal/httpx"
 	"github.com/novoapex/novoapex-backend-api/internal/integrations/paystack"
-	"github.com/novoapex/novoapex-backend-api/internal/integrations/smtp"
 	"github.com/novoapex/novoapex-backend-api/internal/integrations/whatsapp"
+	"github.com/novoapex/novoapex-backend-api/internal/observability"
+	"github.com/novoapex/novoapex-backend-api/internal/queue"
 	"github.com/novoapex/novoapex-backend-api/internal/storage"
 )
 
 func main() {
-	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
-	slog.SetDefault(logger)
+	mobileOnly := flag.Bool("mobile", false, "serve only the mobile API on MOBILE_API_PORT (standalone apps/mobile-api)")
+	flag.Parse()
 
 	cfg, err := config.Load()
 	if err != nil {
-		logger.Error("load config", slog.Any("error", err))
+		slog.New(slog.NewJSONHandler(os.Stdout, nil)).Error("load config", slog.Any("error", err))
 		os.Exit(1)
+	}
+
+	service := "api"
+	if *mobileOnly {
+		service = "mobile-api"
+	}
+	logger, sentryOn, flush := observability.Bootstrap(observability.BootstrapConfig{
+		Service: service, NodeEnv: cfg.NodeEnv, LogLevel: cfg.LogLevel,
+	})
+	defer flush()
+	var middleware []func(http.Handler) http.Handler
+	var dbTracer pgx.QueryTracer
+	if sentryOn {
+		middleware = append(middleware, observability.HTTPMiddleware)
+		dbTracer = observability.PGXTracer{}
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
@@ -44,6 +63,7 @@ func main() {
 		MaxConns:    int32(cfg.DatabasePoolMax),
 		IdleTimeout: time.Duration(cfg.DatabasePoolIdleTimeoutMS) * time.Millisecond,
 		ConnTimeout: time.Duration(cfg.DatabasePoolConnectionTimeoutMS) * time.Millisecond,
+		Tracer:      dbTracer,
 	})
 	if err != nil {
 		logger.Error("connect database", slog.Any("error", err))
@@ -63,96 +83,56 @@ func main() {
 	}
 	defer func() { _ = rdb.Close() }()
 
-	kernel := httpx.New()
-	kernel.MountHealth(httpx.HealthDeps{
-		DB:    httpx.NewPGPinger(pool),
-		Redis: httpx.NewRedisPinger(rdb),
+	redisAddr := net.JoinHostPort(cfg.RedisHost, strconv.Itoa(cfg.RedisPort))
+	qclient := queue.NewClientWithConfig(queue.ClientConfig{
+		RedisAddr: redisAddr,
+		RedisPass: cfg.RedisPassword,
+		RedisTLS:  cfg.RedisTLS,
+		Logger:    logger,
 	})
-
-	kernel.Router.NotFound(func(w http.ResponseWriter, r *http.Request) {
-		httpx.WriteError(w, r, httpx.NewHTTPException(http.StatusNotFound,
-			fmt.Sprintf("Cannot %s %s", r.Method, r.URL.Path)))
-	})
-
-	storageProvider := storage.NewDefaultProvider(cfg)
-	waClient := whatsapp.New(cfg.WhatsAppAPIVersion, cfg.WhatsAppAccessToken)
-	psClient := paystack.New(paystack.Config{
-		SecretKey: cfg.PaystackSecretKey,
-		BaseURL:   cfg.PaystackBaseURL,
-	})
-
-	authDeps := handlers.AuthDeps{
-		Redis:      auth.NewGoRedisAdapter(rdb),
-		Pool:       pool,
-		Secret:     cfg.JWTSecret,
-		Mailer:     otpMailer{cfg: smtp.Config{Host: cfg.SMTPHost, Port: cfg.SMTPPort, User: cfg.SMTPUser, Pass: cfg.SMTPPass}},
-		WhatsApp:   waSender{c: waClient},
-		WhatsAppID: cfg.WhatsAppPhoneNumberID,
-	}
-	qclient := queue.NewClientWithLogger(net.JoinHostPort(cfg.RedisHost, strconv.Itoa(cfg.RedisPort)), cfg.RedisPassword, logger)
 	defer func() { _ = qclient.Close() }()
 
-	kernel.Router.Group(func(pub chi.Router) {
-		handlers.MountWebhooks(pub, handlers.WebhookDeps{
-			Pool:           pool,
-			Publisher:      qclient,
-			AppSecret:      cfg.WhatsAppAppSecret,
-			VerifyToken:    cfg.WhatsAppVerifyToken,
-			PaystackSecret: cfg.PaystackSecretKey,
-		})
-		pub.Route("/messages", func(m chi.Router) {
-			handlers.MountMessages(m, handlers.MessagesDeps{
-				WA:            waClient,
-				PhoneNumberID: cfg.WhatsAppPhoneNumberID,
-			})
-		})
-	})
+	queueRedis := asynq.RedisClientOpt{Addr: redisAddr, Password: cfg.RedisPassword}
+	if cfg.RedisTLS {
+		queueRedis.TLSConfig = queue.TLSServerConfig(cfg.RedisHost)
+	}
+	if !*mobileOnly {
+		// QueueProducerModule registers every queue; declare them so the
+		// dashboard lists each one before its first job.
+		if err := queue.DeclareQueues(ctx, queueRedis); err != nil {
+			logger.Warn("declare queues for the dashboard", slog.Any("error", err))
+		}
+	}
 
-	kernel.Router.Route("/auth", func(a chi.Router) {
-		a.Use(auth.Middleware(cfg.JWTSecret, func(r *http.Request) bool {
-			if r.Method != http.MethodPost {
-				return false
-			}
-			return r.URL.Path == "/auth/request-otp" || r.URL.Path == "/auth/verify-otp"
-		}))
-		handlers.MountAuth(a, authDeps)
+	kernel, closeRouter, err := buildRouter(routerDeps{
+		cfg:        cfg,
+		pool:       pool,
+		rdb:        rdb,
+		publisher:  qclient,
+		queueRedis: queueRedis,
+		storage:    storage.NewDefaultProvider(cfg),
+		wa:         whatsapp.New(cfg.WhatsAppAPIVersion, cfg.WhatsAppAccessToken),
+		paystack:   paystack.New(paystack.Config{SecretKey: cfg.PaystackSecretKey, BaseURL: cfg.PaystackBaseURL}),
+		mobileOnly: *mobileOnly,
+		middleware: middleware,
 	})
+	if err != nil {
+		logger.Error("build router", slog.Any("error", err))
+		os.Exit(1)
+	}
+	defer func() { _ = closeRouter() }()
 
-	kernel.Router.Group(func(v chi.Router) {
-		v.Use(auth.Middleware(cfg.JWTSecret, nil))
-		v.Handle("/", handlers.NewRoot())
-		v.Mount("/customers", handlers.NewCustomers(pool))
-		v.Route("/products", func(pr chi.Router) {
-			pr.Mount("/", handlers.NewProducts(pool))
-			handlers.MountProductsWrite(pr, handlers.ProductsDeps{
-				Pool: pool, Storage: storageProvider,
-			})
-		})
-		v.Route("/orders", func(or chi.Router) {
-			or.Mount("/", handlers.NewOrders(pool))
-			handlers.MountOrdersWrite(or, handlers.OrdersWriteDeps{Pool: pool})
-		})
-		v.Mount("/inbox", handlers.NewInbox(pool))
-		v.Route("/conversations", func(cr chi.Router) {
-			cr.Mount("/", handlers.NewConversations(pool))
-			handlers.MountConversationsWrite(cr, handlers.ConversationsWriteDeps{Pool: pool})
-		})
-		v.Mount("/dashboard", handlers.NewDashboard(pool))
-		v.Mount("/analytics", handlers.NewAnalytics(pool))
-		v.Route("/payouts", func(pr chi.Router) {
-			pr.Mount("/", handlers.NewPayouts(pool))
-			handlers.MountPayoutsWrite(pr, handlers.PayoutsWriteDeps{Pool: pool, Paystack: psClient})
-		})
-		v.Route("/businesses", func(b chi.Router) { handlers.MountBusinesses(b, handlers.BusinessesDeps{Pool: pool}) })
-	})
-
-	addr := ":" + itoa(cfg.Port)
+	port := cfg.Port
+	if *mobileOnly {
+		port = cfg.MobileAPIPort
+	}
+	addr := ":" + strconv.Itoa(port)
 	srv, err := kernel.Start(addr)
 	if err != nil {
 		logger.Error("start server", slog.String("addr", addr), slog.Any("error", err))
 		os.Exit(1)
 	}
-	logger.Info("api listening", slog.String("addr", addr))
+	logger.Info("Application running on port "+strconv.Itoa(port), slog.String("service", service))
 
 	<-ctx.Done()
 	kernel.BeginShutdown()
@@ -162,20 +142,4 @@ func main() {
 	if err := httpx.Shutdown(shutdownCtx, srv); err != nil {
 		logger.Error("graceful shutdown failed", slog.Any("error", err))
 	}
-}
-
-type otpMailer struct{ cfg smtp.Config }
-
-func (m otpMailer) SendOtpEmail(to, code string) error {
-	return smtp.SendOTPEmail(m.cfg, to, code)
-}
-
-type waSender struct{ c *whatsapp.Client }
-
-func (w waSender) SendTextMessage(phoneNumberID, to, text string) error {
-	return w.c.SendTextMessage(context.Background(), phoneNumberID, to, text)
-}
-
-func itoa(n int) string {
-	return strconv.Itoa(n)
 }

@@ -42,10 +42,11 @@ import (
 	"time"
 
 	"github.com/go-chi/chi/v5"
-	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/novoapex/novoapex-backend-api/internal/httpx"
+	"github.com/novoapex/novoapex-backend-api/internal/idempotency"
 	"github.com/novoapex/novoapex-backend-api/internal/queue"
 )
 
@@ -225,74 +226,49 @@ func ww_handle(d WebhookDeps) http.HandlerFunc {
 	}
 }
 
-// ww_ingestMessage runs the per-message transactional gate: INSERT
-// webhook_events ON CONFLICT DO NOTHING, scoped around the publish attempt
-// (see the file comment for why the row lives on the producer side).
+// ww_ingestMessage gates one message through the webhook idempotency service
+// (WebhooksService, internal/idempotency):
 //
-//	rows==0  -> duplicate delivery: skip publishing, still ok
-//	rows==1  -> publish; success commits the row, failure rolls it back and
-//	            logs 'webhook_enqueue_failed' (never surfaced to Meta)
+//	already seen -> duplicate delivery: skip publishing, still ok
+//	new          -> claim the key and publish in one transaction; a failed
+//	                publish rolls the claim back and logs
+//	                'webhook_enqueue_failed' (never surfaced to Meta)
 func ww_ingestMessage(ctx context.Context, d WebhookDeps, senderPhone, idempotencyKey string, job ww_jobData) {
-	if d.Pool == nil {
+	logFailure := func(err string) {
 		slog.Error("Failed to enqueue webhook job",
 			"event", "webhook_enqueue_failed",
 			"idempotencyKey", idempotencyKey,
 			"senderPhone", senderPhone,
-			"error", "no database pool wired")
-		return
+			"error", err)
 	}
-
-	tx, err := d.Pool.Begin(ctx)
-	if err != nil {
-		slog.Error("Failed to enqueue webhook job",
-			"event", "webhook_enqueue_failed",
-			"idempotencyKey", idempotencyKey,
-			"senderPhone", senderPhone,
-			"error", err.Error())
-		return
-	}
-	defer func() { _ = tx.Rollback(ctx) }()
-
-	tag, err := tx.Exec(ctx,
-		`INSERT INTO webhook_events (id, idempotency_key, processed_at)
-		 VALUES ($1, $2, now())
-		 ON CONFLICT (idempotency_key) DO NOTHING`,
-		uuid.NewString(), idempotencyKey)
-	if err != nil {
-		slog.Error("Failed to enqueue webhook job",
-			"event", "webhook_enqueue_failed",
-			"idempotencyKey", idempotencyKey,
-			"senderPhone", senderPhone,
-			"error", err.Error())
-		return
-	}
-
-	if tag.RowsAffected() == 0 {
+	logDuplicate := func() {
 		slog.Warn("Duplicate webhook event — skipping",
 			"event", "duplicate_webhook_rejected",
 			"idempotencyKey", idempotencyKey)
+	}
+	if d.Pool == nil {
+		logFailure("no database pool wired")
+		return
+	}
+	store := idempotency.Store{Pool: d.Pool}
+
+	// Meta redelivers aggressively; known duplicates skip the write path.
+	if seen, err := store.Seen(ctx, idempotencyKey); err == nil && seen {
+		logDuplicate()
 		return
 	}
 
-	// BullMQ add() options -> EnqueueOpts: jobId + deduplication ttl 60s
-	// (whatsapp.controller.ts:140-148); queue policy carries MaxRetry 2.
-	err = d.Publisher.Enqueue(ctx, queue.QWebhookProcessing, queue.TaskWebhookProcess, job,
-		&queue.EnqueueOpts{TaskID: idempotencyKey, MaxRetry: 2, UniqueTTL: 60 * time.Second})
-	if err != nil {
-		slog.Error("Failed to enqueue webhook job",
-			"event", "webhook_enqueue_failed",
-			"idempotencyKey", idempotencyKey,
-			"senderPhone", senderPhone,
-			"error", err.Error())
-		return // defer rolls the idempotency row back
-	}
-
-	if err := tx.Commit(ctx); err != nil {
-		slog.Error("Failed to commit webhook event",
-			"event", "webhook_enqueue_failed",
-			"idempotencyKey", idempotencyKey,
-			"error", err.Error())
-		return
+	processed, err := store.ProcessOnce(ctx, idempotencyKey, func(pgx.Tx) error {
+		// BullMQ add() options -> EnqueueOpts: jobId + deduplication ttl 60s
+		// (whatsapp.controller.ts:140-148); queue policy carries MaxRetry 2.
+		return d.Publisher.Enqueue(ctx, queue.QWebhookProcessing, queue.TaskWebhookProcess, job,
+			&queue.EnqueueOpts{TaskID: idempotencyKey, MaxRetry: 2, UniqueTTL: 60 * time.Second})
+	})
+	switch {
+	case err != nil:
+		logFailure(err.Error())
+	case !processed:
+		logDuplicate() // lost a race with a concurrent delivery of the same message
 	}
 }
 

@@ -1,11 +1,7 @@
-// Command worker is the Go queue consumer runtime (T6.2). It mirrors
-// apps/worker/src/main.ts semantics: a headless process running the queue
-// processors and (from Stage 7) cron sweeps, with graceful SIGTERM shutdown.
-//
-// Registration calls exported by sibling worker packages are added centrally
-// here as each stage lands; today it consumes the embedding queue (Stage 6)
-// plus a no-op placeholder for orchestrator-queue so that pipeline cannot get
-// stuck once its producers move over.
+// Command worker is the headless queue-consumer process (apps/worker): every
+// asynq task handler plus the cron sweeps, with graceful SIGTERM shutdown.
+// Scale it independently of the API so an LLM burst cannot degrade webhook
+// ingestion.
 package main
 
 import (
@@ -22,26 +18,43 @@ import (
 	"time"
 
 	"github.com/hibiken/asynq"
+	"github.com/jackc/pgx/v5"
+
 	"github.com/novoapex/novoapex-backend-api/internal/config"
 	"github.com/novoapex/novoapex-backend-api/internal/db"
 	"github.com/novoapex/novoapex-backend-api/internal/integrations/google"
 	"github.com/novoapex/novoapex-backend-api/internal/integrations/openai"
 	"github.com/novoapex/novoapex-backend-api/internal/integrations/paystack"
 	"github.com/novoapex/novoapex-backend-api/internal/integrations/whatsapp"
+	"github.com/novoapex/novoapex-backend-api/internal/observability"
 	"github.com/novoapex/novoapex-backend-api/internal/orchestrator"
 	"github.com/novoapex/novoapex-backend-api/internal/queue"
 	"github.com/novoapex/novoapex-backend-api/internal/workers"
 )
 
 func main() {
-	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
-	slog.SetDefault(logger)
-
 	cfg, err := config.Load()
 	if err != nil {
-		logger.Error("load config", slog.Any("error", err))
+		slog.New(slog.NewJSONHandler(os.Stdout, nil)).Error("load config", slog.Any("error", err))
 		os.Exit(1)
 	}
+
+	logger, sentryOn, flush := observability.Bootstrap(observability.BootstrapConfig{
+		Service: "worker", NodeEnv: cfg.NodeEnv, LogLevel: cfg.LogLevel,
+	})
+	defer flush()
+	var dbTracer pgx.QueryTracer
+	var taskMiddleware func(string, queue.Handler) queue.Handler
+	if sentryOn {
+		queue.SentryHook = observability.CaptureTaskFailure
+		dbTracer = observability.PGXTracer{}
+		taskMiddleware = func(taskType string, next queue.Handler) queue.Handler {
+			return func(ctx context.Context, payload []byte) error {
+				return observability.TraceTask(ctx, taskType, func(ctx context.Context) error { return next(ctx, payload) })
+			}
+		}
+	}
+	defer observability.CapturePanic(context.Background())
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
 	defer stop()
@@ -50,6 +63,7 @@ func main() {
 		MaxConns:    int32(cfg.DatabasePoolMax),
 		IdleTimeout: time.Duration(cfg.DatabasePoolIdleTimeoutMS) * time.Millisecond,
 		ConnTimeout: time.Duration(cfg.DatabasePoolConnectionTimeoutMS) * time.Millisecond,
+		Tracer:      dbTracer,
 	})
 	if err != nil {
 		logger.Error("connect database", slog.Any("error", err))
@@ -59,7 +73,12 @@ func main() {
 
 	redisAddr := net.JoinHostPort(cfg.RedisHost, strconv.Itoa(cfg.RedisPort))
 
-	client := queue.NewClientWithLogger(redisAddr, cfg.RedisPassword, logger)
+	client := queue.NewClientWithConfig(queue.ClientConfig{
+		RedisAddr: redisAddr,
+		RedisPass: cfg.RedisPassword,
+		RedisTLS:  cfg.RedisTLS,
+		Logger:    logger,
+	})
 	defer func() { _ = client.Close() }()
 
 	server := queue.NewServer(queue.ServerConfig{
@@ -68,94 +87,127 @@ func main() {
 		RedisTLS:        cfg.RedisTLS,
 		Concurrency:     workerConcurrency(),
 		GracefulTimeout: queue.DefaultGracefulTimeout,
+		Middleware:      taskMiddleware,
 		Logger:          logger,
 	})
 	defer func() { _ = server.Close() }()
 
-	// Stage 6 consumers.
-	if err := workers.RegisterEmbedding(server, workers.EmbeddingDeps{
-		Pool:   pool,
-		OpenAI: openai.New(openai.Config{APIKey: cfg.OpenAIAPIKey, BaseURL: os.Getenv("OPENAI_BASE_URL")}),
-		Google: google.New(google.Config{APIKey: cfg.GoogleGenerativeAIAPIKey, BaseURL: os.Getenv("GOOGLE_GENERATIVE_AI_BASE_URL")}),
-	}); err != nil {
-		logger.Error("register embedding handlers", slog.Any("error", err))
-		os.Exit(1)
-	}
-
-	// Stage 7 consumers.
+	openaiBaseURL := os.Getenv("OPENAI_BASE_URL")
+	openaiClient := openai.New(openai.Config{APIKey: cfg.OpenAIAPIKey, BaseURL: openaiBaseURL})
+	gemini := google.New(google.Config{APIKey: cfg.GoogleGenerativeAIAPIKey, BaseURL: os.Getenv("GOOGLE_GENERATIVE_AI_BASE_URL")})
 	wa := whatsapp.New(cfg.WhatsAppAPIVersion, cfg.WhatsAppAccessToken)
 	psc := paystack.New(paystack.Config{SecretKey: cfg.PaystackSecretKey, BaseURL: cfg.PaystackBaseURL})
-	stage7Deps := workers.Deps{
+
+	// Inbound: webhook-processing persists the message and debounces the
+	// orchestrator run.
+	workers.RegisterWebhookProcessing(server, workers.WebhookDeps{Pool: pool, Publisher: client})
+
+	// Conversation pipeline.
+	workers.RegisterOrchestrator(server, workers.OrchestratorDeps{
+		Pool:      pool,
+		Publisher: client,
+		LLM:       orchestrator.NewResponsesLLM(orchestrator.LLMConfig{APIKey: cfg.OpenAIAPIKey, BaseURL: openaiBaseURL}),
+		Catalog: orchestrator.CatalogAdapter(orchestrator.RetrieverDeps{Pool: pool, OpenAI: openaiClient}, func(ctx context.Context, image []byte, mimeType string) ([]float32, error) {
+			return gemini.EmbedContent(ctx, workers.ImageEmbeddingModel, workers.ImageEmbeddingDimensions, []google.Part{{InlineData: &google.InlineData{MimeType: mimeType, Data: base64.StdEncoding.EncodeToString(image)}}})
+		}),
+		Media: workers.NewMediaProcessor(
+			orchestrator.NewMediaDownloader(orchestrator.MediaConfig{
+				Token:   cfg.WhatsAppAccessToken,
+				Version: cfg.WhatsAppAPIVersion,
+				BaseURL: os.Getenv("WHATSAPP_BASE_URL"),
+			}),
+			openaiClient,
+		),
+	})
+
+	// Outbound: the sole sender of WhatsApp messages.
+	workers.RegisterOutbound(server, workers.OutboundDeps{Pool: pool, WA: wa})
+
+	// Stealth CRM, payments, follow-ups, embeddings.
+	workers.RegisterCRM(server, workers.CRMDeps{Pool: pool, Publisher: client, Paystack: psInitiator{c: psc}})
+	deps := workers.Deps{
 		Pool:                            pool,
 		Publisher:                       client,
 		WA:                              wa,
 		ReengagementThresholdMultiplier: cfg.ReengagementThresholdMultiplier,
 		ReengagementCooldownDays:        cfg.ReengagementCooldownDays,
+		NewArrivalsIntervalDays:         cfg.NewArrivalsIntervalDays,
 	}
-	workers.RegisterPaymentEvents(server, stage7Deps)
-	workers.RegisterFollowUp(server, stage7Deps)
-	workers.RegisterCRM(server, workers.CRMDeps{Pool: pool, Publisher: client, Paystack: psInitiator{c: psc}})
+	workers.RegisterPaymentEvents(server, deps)
+	workers.RegisterFollowUp(server, deps)
+	if err := workers.RegisterEmbedding(server, workers.EmbeddingDeps{Pool: pool, OpenAI: openaiClient, Google: gemini}); err != nil {
+		logger.Error("register embedding handlers", slog.Any("error", err))
+		os.Exit(1)
+	}
 
-	cronDeps := stage7Deps
+	workers.RegisterExample(server, logger)
+
+	// Cron sweeps: the scheduler enqueues one task per tick onto the default
+	// queue; each sweep takes an advisory lock, so replicas never double-fire.
 	for _, ce := range workers.CronSpecs() {
-		ce := ce
-		server.Register(ce.TaskType, func(ctx context.Context, _ []byte) error {
-			switch ce.Spec {
-			case "follow-up-scanner":
-				return workers.SweepFollowUps(ctx, cronDeps)
-			case "outbox-sweep":
-				return workers.SweepOutbox(ctx, cronDeps)
-			case "retention-scanner":
-				return workers.SweepRetention(ctx, cronDeps)
-			default:
-				return fmt.Errorf("unknown cron spec %q", ce.Spec)
-			}
-		})
+		server.Register(ce.TaskType, cronHandler(ce.Spec, deps))
 	}
-
-	// Stage 8 orchestrator consumer.
-	llmClient := orchestrator.NewResponsesLLM(orchestrator.LLMConfig{
-		APIKey:  cfg.OpenAIAPIKey,
-		BaseURL: os.Getenv("OPENAI_BASE_URL"),
-	})
-	embedClient := openai.New(openai.Config{APIKey: cfg.OpenAIAPIKey, BaseURL: os.Getenv("OPENAI_BASE_URL")})
-	gemini := google.New(google.Config{APIKey: cfg.GoogleGenerativeAIAPIKey, BaseURL: os.Getenv("GOOGLE_GENERATIVE_AI_BASE_URL")})
-	workers.RegisterOrchestrator(server, workers.OrchestratorDeps{
-		Pool:      pool,
-		Publisher: client,
-		LLM:       llmClient,
-		Catalog: orchestrator.CatalogAdapter(orchestrator.RetrieverDeps{Pool: pool, OpenAI: embedClient}, func(ctx context.Context, image []byte, mimeType string) ([]float32, error) {
-			return gemini.EmbedContent(ctx, "gemini-embedding-001", 768, []google.Part{{InlineData: &google.InlineData{MimeType: mimeType, Data: base64.StdEncoding.EncodeToString(image)}}})
-		}),
-	})
-
 	sched := asynq.NewScheduler(asynq.RedisClientOpt{
-		Addr:     redisAddr,
-		Password: cfg.RedisPassword,
-		TLSConfig: func() *tls.Config {
-			if cfg.RedisTLS {
-				return queue.TLSServerConfig(cfg.RedisHost)
-			}
-			return nil
-		}(),
-	}, &asynq.SchedulerOpts{Location: time.Local})
+		Addr:      redisAddr,
+		Password:  cfg.RedisPassword,
+		TLSConfig: redisTLS(cfg),
+	}, &asynq.SchedulerOpts{Location: time.UTC, Logger: schedulerLogger{logger}})
 	for _, ce := range workers.CronSpecs() {
-		if _, err := sched.Register(ce.Cron, asynq.NewTask(ce.TaskType, nil)); err != nil {
+		if _, err := sched.Register(ce.Cron, asynq.NewTask(ce.TaskType, nil),
+			asynq.MaxRetry(0), asynq.Timeout(10*time.Minute)); err != nil {
 			logger.Error("register cron", slog.String("spec", ce.Spec), slog.Any("error", err))
 			os.Exit(1)
 		}
 	}
-	if err := sched.Run(); err != nil {
-		logger.Error("cron scheduler terminated", slog.Any("error", err))
-		os.Exit(1)
-	}
-	defer sched.Shutdown()
 
-	logger.Info("worker process started — processing queues and cron sweeps")
-	if err := server.Run(); err != nil {
-		logger.Error("worker runtime terminated with error", slog.Any("error", err))
+	// Start (non-blocking) both runtimes, then wait for the shutdown signal.
+	// asynq's Run() variants each block on their own signal wait, which is why
+	// they cannot be chained.
+	if err := sched.Start(); err != nil {
+		logger.Error("start cron scheduler", slog.Any("error", err))
 		os.Exit(1)
 	}
+	if err := server.Start(); err != nil {
+		sched.Shutdown()
+		logger.Error("start worker runtime", slog.Any("error", err))
+		os.Exit(1)
+	}
+	if err := queue.DeclareQueues(ctx, asynq.RedisClientOpt{Addr: redisAddr, Password: cfg.RedisPassword, TLSConfig: redisTLS(cfg)}); err != nil {
+		logger.Warn("declare queues for the dashboard", slog.Any("error", err))
+	}
+	logger.Info("Worker process started — processing queues and cron sweeps",
+		slog.Int("concurrency", workerConcurrency()))
+
+	<-ctx.Done()
+	logger.Info("worker shutting down")
+	sched.Shutdown()
+	if err := server.Stop(); err != nil {
+		logger.Error("worker graceful shutdown", slog.Any("error", err))
+	}
+}
+
+func cronHandler(spec string, deps workers.Deps) queue.Handler {
+	return func(ctx context.Context, _ []byte) error {
+		switch spec {
+		case "follow-up-scanner":
+			return workers.SweepFollowUps(ctx, deps)
+		case "outbox-sweep":
+			return workers.SweepOutbox(ctx, deps)
+		case "retention-scanner":
+			return workers.SweepRetention(ctx, deps)
+		case "new-arrivals-scanner":
+			return workers.SweepNewArrivals(ctx, deps)
+		default:
+			return fmt.Errorf("unknown cron spec %q", spec)
+		}
+	}
+}
+
+func redisTLS(cfg *config.Config) *tls.Config {
+	if !cfg.RedisTLS {
+		return nil
+	}
+	return queue.TLSServerConfig(cfg.RedisHost)
 }
 
 type psInitiator struct{ c *paystack.Client }
@@ -180,7 +232,16 @@ func (p psInitiator) InitiatePayment(ctx context.Context, req workers.PaymentReq
 func workerConcurrency() int {
 	n, err := strconv.Atoi(os.Getenv("WORKER_CONCURRENCY"))
 	if err != nil || n <= 0 {
-		return 0
+		return queue.DefaultConcurrency
 	}
 	return n
 }
+
+// schedulerLogger routes asynq scheduler internals through slog.
+type schedulerLogger struct{ log *slog.Logger }
+
+func (l schedulerLogger) Debug(args ...any) { l.log.Debug(fmt.Sprint(args...)) }
+func (l schedulerLogger) Info(args ...any)  { l.log.Info(fmt.Sprint(args...)) }
+func (l schedulerLogger) Warn(args ...any)  { l.log.Warn(fmt.Sprint(args...)) }
+func (l schedulerLogger) Error(args ...any) { l.log.Error(fmt.Sprint(args...)) }
+func (l schedulerLogger) Fatal(args ...any) { l.log.Error("fatal: " + fmt.Sprint(args...)) }

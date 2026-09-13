@@ -12,8 +12,6 @@ import (
 	"time"
 )
 
-const expectedMigrationCount = 14
-
 func requireDocker(t *testing.T) {
 	t.Helper()
 	sock := os.Getenv("DOCKER_HOST")
@@ -56,26 +54,16 @@ func startHarness(t *testing.T) *Harness {
 	return h
 }
 
-func harnessRepoDir(t *testing.T) string {
+func applyBaseline(t *testing.T, dsn string) {
 	t.Helper()
-	repo, err := NovoApexRepoDir()
-	if err != nil {
-		t.Skipf("novoapex repo not reachable: %v", err)
-	}
-	return repo
-}
-
-func applyMigrations(t *testing.T, dsn, repoDir string) {
-	t.Helper()
-	if err := ApplyPrismaMigrations(t.Context(), repoDir, dsn); err != nil {
-		t.Fatalf("prisma migrate deploy: %v", err)
+	if err := ApplyBaselineSchema(t.Context(), dsn); err != nil {
+		t.Fatalf("apply baseline schema: %v", err)
 	}
 }
 
-func TestMigrationsApplyCleanlyFromEmpty(t *testing.T) {
+func TestBaselineSchemaAppliesCleanlyFromEmpty(t *testing.T) {
 	h := startHarness(t)
-	repoDir := harnessRepoDir(t)
-	applyMigrations(t, h.PostgresDSN, repoDir)
+	applyBaseline(t, h.PostgresDSN)
 
 	db, err := sql.Open("pgx", h.PostgresDSN)
 	if err != nil {
@@ -83,49 +71,16 @@ func TestMigrationsApplyCleanlyFromEmpty(t *testing.T) {
 	}
 	defer func() { _ = db.Close() }()
 
-	var applied int
-	if err := db.QueryRow(
-		`SELECT COUNT(*) FROM _prisma_migrations WHERE finished_at IS NOT NULL`,
-	).Scan(&applied); err != nil {
-		t.Fatalf("query applied migrations: %v", err)
-	}
-	if applied != expectedMigrationCount {
-		t.Errorf("applied migrations = %d, want %d", applied, expectedMigrationCount)
-	}
-
-	var failed int
-	if err := db.QueryRow(
-		`SELECT COUNT(*) FROM _prisma_migrations WHERE finished_at IS NULL OR logs IS NOT NULL`,
-	).Scan(&failed); err != nil {
-		t.Fatalf("query failed migrations: %v", err)
-	}
-	if failed != 0 {
-		t.Errorf("failed/incomplete migrations = %d, want 0", failed)
-	}
-}
-
-func TestMigrationsIdempotentOnRerun(t *testing.T) {
-	h := startHarness(t)
-	repoDir := harnessRepoDir(t)
-
-	for i := 0; i < 2; i++ {
-		applyMigrations(t, h.PostgresDSN, repoDir)
-	}
-
-	db, err := sql.Open("pgx", h.PostgresDSN)
-	if err != nil {
-		t.Fatalf("open db: %v", err)
-	}
-	defer func() { _ = db.Close() }()
-
-	var applied int
-	if err := db.QueryRow(
-		`SELECT COUNT(*) FROM _prisma_migrations WHERE finished_at IS NOT NULL`,
-	).Scan(&applied); err != nil {
-		t.Fatalf("query applied migrations: %v", err)
-	}
-	if applied != expectedMigrationCount {
-		t.Errorf("after re-run applied migrations = %d, want %d (re-run must be a no-op)", applied, expectedMigrationCount)
+	for _, table := range []string{"businesses", "conversations", "orders", "customers", "products"} {
+		var exists bool
+		if err := db.QueryRow(
+			`SELECT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = $1)`, table,
+		).Scan(&exists); err != nil {
+			t.Fatalf("check table %s: %v", table, err)
+		}
+		if !exists {
+			t.Errorf("expected table %s to exist after baseline apply", table)
+		}
 	}
 }
 

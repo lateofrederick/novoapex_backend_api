@@ -112,6 +112,13 @@ func (f *wp_providerFactory) GetProvider(name string) (PaymentProvider, error) {
 
 func (f *wp_providerFactory) GetDefault() PaymentProvider { return f.def }
 
+// PaymentProviderNames lists the payment providers accepted at
+// /webhooks/payments/{provider} (PaymentProviderFactory.getAvailableProviders),
+// e.g. for API documentation.
+func PaymentProviderNames() []string {
+	return wp_newProviderFactory("").GetAvailableProviders()
+}
+
 func (f *wp_providerFactory) GetAvailableProviders() []string {
 	names := make([]string, 0, len(f.providers))
 	for n := range f.providers {
@@ -142,7 +149,9 @@ func wp_handle(factory *wp_providerFactory, publisher queue.Publisher) http.Hand
 		if err != nil {
 			slog.Warn("Unknown payment provider in webhook URL",
 				"event", "payment_webhook_unknown_provider",
-				"providerName", providerName)
+				"providerName", providerName,
+				"availableProviders", factory.GetAvailableProviders(),
+				"error", err.Error())
 			wp_plainJSON(w, http.StatusBadRequest, map[string]string{"error": "Unknown provider"})
 			return
 		}
