@@ -17,7 +17,14 @@ const (
 	QPaymentEvents     = "payment-events"
 	QFollowUp          = "follow-up"
 	QEmbedding         = "embedding"
+	QExample           = "example-queue"
 )
+
+// AllQueues lists every queue the system declares (QueueProducerModule's
+// registerQueue list), so dashboards show them before their first job.
+func AllQueues() []string {
+	return []string{QExample, QOrchestrator, QOutbound, QWebhookProcessing, QCRMMaterialiser, QPaymentEvents, QFollowUp, QEmbedding}
+}
 
 // Task types — mirror the Node job name for every enqueue site.
 const (
@@ -29,6 +36,10 @@ const (
 	TaskEmbedProduct         = "embedding:embed-product"
 	TaskEmbedProductImage    = "embedding:embed-product-image"
 	TaskFollowUpRun          = "follow-up:run" // payload.job_type switches abandoned-cart/unpaid-invoice-first/unpaid-invoice-second/delivery-confirmation/re-engagement
+
+	// TaskExamplePrefix routes every job on example-queue, whatever its name
+	// ("example-queue:<name>"), to the example processor.
+	TaskExamplePrefix = "example-queue:"
 )
 
 // EnqueueOpts mirrors the per-site BullMQ jobOptions (plan §B.2 table).

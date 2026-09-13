@@ -21,15 +21,19 @@ type CronEntry struct {
 	Payload  any
 }
 
-// CronSpecs returns the three Stage 7 cron definitions
+// CronSpecs returns the Stage 7 cron definitions
 // (follow-up-scanner.processor.ts:31, outbox-sweep.processor.ts:31,
-// retention-scanner.processor.ts:24). Singleton semantics per run come from
-// pg_advisory_xact_lock(hashtext(spec)) inside each sweep (T7.28).
+// retention-scanner.processor.ts:24) plus the new-arrivals digest scanner
+// (new-arrivals-scanner.processor.ts, this session's Node work). Singleton
+// semantics per run come from pg_advisory_xact_lock(hashtext(spec)) inside
+// each sweep (T7.28).
 func CronSpecs() []CronEntry {
 	return []CronEntry{
 		{Spec: "follow-up-scanner", Cron: "*/1 * * * *", TaskType: "cron:follow-up-scanner"},
 		{Spec: "outbox-sweep", Cron: "*/2 * * * *", TaskType: "cron:outbox-sweep"},
 		{Spec: "retention-scanner", Cron: "0 9 * * *", TaskType: "cron:retention-scanner"},
+		// 8am — an hour ahead of retention-scanner, to spread cron load.
+		{Spec: "new-arrivals-scanner", Cron: "0 8 * * *", TaskType: "cron:new-arrivals-scanner"},
 	}
 }
 
@@ -126,9 +130,9 @@ func SweepOutbox(ctx context.Context, deps Deps) error {
 				"outboundMessageId", msg.id)
 			continue
 		}
-		opts := &queue.EnqueueOpts{TaskID: "outbox-sweep:" + msg.id}
-		if err := deps.Publisher.Enqueue(ctx, queue.QOutbound, queue.TaskOutboundSend,
-			outboundSendJob{OutboundMessageID: msg.id}, opts); err != nil {
+		// Same TaskID as the original publish: a sweep racing a send that is
+		// still queued or retrying collapses into that task (no double send).
+		if err := queue.PublishOutbound(ctx, deps.Publisher, msg.id); err != nil {
 			slog.ErrorContext(ctx, "Failed to re-enqueue stranded message",
 				"outboundMessageId", msg.id,
 				"error", err.Error())

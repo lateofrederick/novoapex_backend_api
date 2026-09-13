@@ -148,7 +148,8 @@ func TestCRMSchemaStructure(t *testing.T) {
 	}
 	wantRequired := []any{
 		"order_confirmed", "detected_items", "delivery_area",
-		"customer_name", "detected_preferences", "sentiment",
+		"fulfillment_choice", "pickup_location_id",
+		"customer_name", "detected_preferences", "wants_updates", "sentiment",
 	}
 	if !reflect.DeepEqual(doc["required"], wantRequired) {
 		t.Errorf("crm required = %v, want %v (declaration order)", doc["required"], wantRequired)
@@ -162,7 +163,7 @@ func TestCRMSchemaStructure(t *testing.T) {
 	}
 
 	// Nullable strings use the zod-to-json-schema anyOf shape.
-	for _, name := range []string{"delivery_area", "customer_name"} {
+	for _, name := range []string{"delivery_area", "pickup_location_id", "customer_name"} {
 		node := p[name].(map[string]any)
 		wantAnyOf := []any{
 			map[string]any{"type": "string"},
@@ -171,6 +172,26 @@ func TestCRMSchemaStructure(t *testing.T) {
 		if !reflect.DeepEqual(node["anyOf"], wantAnyOf) {
 			t.Errorf("%s anyOf = %v, want %v (nullable shape)", name, node["anyOf"], wantAnyOf)
 		}
+	}
+
+	// fulfillment_choice: nullable enum ("delivery" | "pickup").
+	fulfillment := p["fulfillment_choice"].(map[string]any)
+	wantFulfillmentAnyOf := []any{
+		map[string]any{"type": "string", "enum": []any{"delivery", "pickup"}},
+		map[string]any{"type": "null"},
+	}
+	if !reflect.DeepEqual(fulfillment["anyOf"], wantFulfillmentAnyOf) {
+		t.Errorf("fulfillment_choice anyOf = %v, want %v", fulfillment["anyOf"], wantFulfillmentAnyOf)
+	}
+
+	// wants_updates: nullable boolean.
+	wantsUpdates := p["wants_updates"].(map[string]any)
+	wantBoolAnyOf := []any{
+		map[string]any{"type": "boolean"},
+		map[string]any{"type": "null"},
+	}
+	if !reflect.DeepEqual(wantsUpdates["anyOf"], wantBoolAnyOf) {
+		t.Errorf("wants_updates anyOf = %v, want %v", wantsUpdates["anyOf"], wantBoolAnyOf)
 	}
 
 	itemsNode := p["detected_items"].(map[string]any)

@@ -76,12 +76,8 @@ func opipeStart(t *testing.T) *opipeEnv {
 	}
 	t.Cleanup(func() { envH.Terminate(context.Background()) })
 
-	repoDir, err := harness.NovoApexRepoDir()
-	if err != nil {
-		t.Skipf("novoapex repo not reachable: %v", err)
-	}
-	if err := harness.ApplyPrismaMigrations(ctx, repoDir, envH.PostgresDSN); err != nil {
-		t.Fatalf("prisma migrate deploy: %v", err)
+	if err := harness.ApplyBaselineSchema(ctx, envH.PostgresDSN); err != nil {
+		t.Fatalf("apply schema: %v", err)
 	}
 
 	pool, err := pgxpool.New(ctx, envH.PostgresDSN)
@@ -950,5 +946,29 @@ func TestOpipeCompletionRecheckReenqueuesOnNewerInbound(t *testing.T) {
 	}
 	if n := len(e.publisher.ofTask(queue.TaskOrchestratorDebounce)); n != 0 {
 		t.Errorf("re-enqueues without newer inbound = %d, want 0", n)
+	}
+}
+
+// The completion re-check must not depend on the worker and database clocks
+// agreeing: a message persisted BEFORE the run whose created_at is ahead of
+// the worker clock (database clock drifted forward) is not "newer".
+func TestOpipeCompletionRecheckImmuneToClockSkew(t *testing.T) {
+	e := opipeStart(t)
+	biz := e.factory.Business()
+	sender := biz.OwnerPhone
+	opipeInbound(t, e.db, biz.WhatsAppPhoneNumberID, sender, "wamid-skew-1", "hello")
+	if _, err := e.db.Exec(`UPDATE inbound_messages SET created_at = now() + interval '30 seconds' WHERE whatsapp_message_id = 'wamid-skew-1'`); err != nil {
+		t.Fatal(err)
+	}
+
+	e.llm.steps = []orchestrator.LlmResponse{opipeResp(nil)}
+	reg := newOpipeRegistrar()
+	workers.RegisterOrchestrator(reg, e.deps)
+	payload, _ := json.Marshal(workers.OrchestratorJob{RecipientPhone: biz.WhatsAppPhoneNumberID, SenderPhone: sender})
+	if err := reg.handlers[queue.TaskOrchestratorDebounce](context.Background(), payload); err != nil {
+		t.Fatal(err)
+	}
+	if n := len(e.publisher.ofTask(queue.TaskOrchestratorDebounce)); n != 0 {
+		t.Errorf("clock-skewed pre-existing message triggered %d re-enqueue(s), want 0", n)
 	}
 }

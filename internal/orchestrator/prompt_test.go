@@ -46,9 +46,15 @@ func TestSystemPromptAnchorsVerbatim(t *testing.T) {
 		"If no IMAGE MATCH section appears (or it says \"No products visually matched\"), use your vision capability",
 		"6. Set intent to \"product_inquiry\" when the customer's image is clearly about a product, even without text.",
 
+		orchestrator.SectionFulfillmentRules,
+		"1. When a customer expresses clear intent to buy, and BEFORE asking for a delivery address, ask whether they want delivery or pickup — but ONLY if a \"=== PICKUP LOCATIONS ===\" section is present in the context.",
+		"3. If the customer chooses pickup: show them the shops from \"=== PICKUP LOCATIONS ===\" (name, address, and hours — landmark too if it helps them recognise the place) and ask them to pick one. Do NOT ask for a delivery address.",
+		"5. Set fulfillment_choice to \"delivery\" or \"pickup\" as soon as the customer states it, and keep setting it (along with pickup_location_id, if pickup) on every subsequent turn through confirmation — see CRM SIGNAL RULES below.",
+
 		orchestrator.SectionOrderConfirmationRules,
-		"1. When a customer expresses clear intent to buy (e.g. \"I want to order 2 shea butters\"), you MUST ask for their delivery address before finalizing the order (if they haven't provided it yet).",
-		"Example: \"You'd like to order 2x Shea Butter (GH₵45 each) for a total of GH₵90, delivering to 123 Main St. Should I confirm this order?\"",
+		"1. When a customer expresses clear intent to buy (e.g. \"I want to order 2 shea butters\"), you MUST first resolve fulfillment (see FULFILLMENT RULES above) — a delivery address, or a chosen pickup location — before finalizing the order.",
+		"Delivery example: \"You'd like to order 2x Shea Butter (GH₵45 each) for a total of GH₵90, delivering to 123 Main St. Should I confirm this order?\"",
+		"Pickup example: \"You'd like to order 2x Shea Butter (GH₵45 each) for a total of GH₵90, for pickup at Main Street Shop, 12 Main Street. Should I confirm this order?\"",
 		"4. Set order_confirmed=true ONLY in the NEXT turn when the customer explicitly agrees (\"yes\", \"confirm\", \"go ahead\", etc.).",
 
 		orchestrator.SectionPaymentRules,
@@ -60,6 +66,14 @@ func TestSystemPromptAnchorsVerbatim(t *testing.T) {
 		"2. order_confirmed = true ONLY when the user says \"yes\", \"confirm\", \"I'll take it\", or equivalent. Never for inquiries.",
 		"4. detected_preferences captures broad interests (e.g. \"she asked about hair products\" → [\"hair products\"]). Not specific product names.",
 		"5. sentiment reflects the emotional tone: complaints → negative, thanks/praise → positive, neutral otherwise.",
+		"6. fulfillment_choice and pickup_location_id are the one exception to \"this turn only\": once the customer states them, keep repeating the SAME values on every following turn through order confirmation — exactly like detected_items.",
+		"7. wants_updates: do NOT proactively ask the customer about this — only record it if the topic comes up on its own",
+
+		orchestrator.SectionCustomerContextRules,
+		"1. A \"=== CUSTOMER CONTEXT ===\" section, when present, means this is a RETURNING customer — greet them warmly (e.g. \"Welcome back!\") rather than as a stranger, but only when it fits naturally; don't force it into every reply.",
+		"2. If it names a \"Most frequently ordered\" product and that product comes up naturally (they're browsing, it's back in stock, they ask \"what do you have\"), you may mention it — e.g. \"your usual Shea Butter is back in stock\" — but never hard-sell it onto an unrelated question.",
+		"3. If it names a \"Known delivery area\" and the customer is placing a new order for delivery, offer it as a suggestion instead of asking blind",
+		"4. No \"=== CUSTOMER CONTEXT ===\" section means either a brand-new lead or a customer with no order history yet — treat them as such, and do not fabricate any history.",
 	} {
 		if !strings.Contains(prompt, anchor) {
 			t.Errorf("system prompt missing verbatim anchor:\n%q", anchor)
@@ -74,9 +88,11 @@ func TestSystemPromptSectionOrder(t *testing.T) {
 		orchestrator.SectionRules,
 		orchestrator.SectionProductImageRules,
 		orchestrator.SectionCustomerImageRules,
+		orchestrator.SectionFulfillmentRules,
 		orchestrator.SectionOrderConfirmationRules,
 		orchestrator.SectionPaymentRules,
 		orchestrator.SectionCrmSignalRules,
+		orchestrator.SectionCustomerContextRules,
 	}
 	last := -1
 	for _, section := range order {

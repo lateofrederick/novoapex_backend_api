@@ -125,7 +125,7 @@ func TestS6EnqueueOptsMapping(t *testing.T) {
 			name:  "unique ttl",
 			queue: QOutbound,
 			opts:  &EnqueueOpts{UniqueTTL: time.Minute},
-			want:  []string{`Queue("outbound-queue")`, "MaxRetry(0)", "Unique(1m0s)"},
+			want:  []string{`Queue("outbound-queue")`, "MaxRetry(2)", "Unique(1m0s)"},
 		},
 		{
 			name:  "retain ttl retention",
@@ -167,7 +167,7 @@ func TestS6PolicyTableMatchesB2(t *testing.T) {
 	}{
 		{QWebhookProcessing, 2, time.Second, 100, 10 * time.Second},
 		{QOrchestrator, 0, 0, 0, 0},
-		{QOutbound, 0, 0, 50, time.Second},
+		{QOutbound, 2, 2 * time.Second, 50, time.Second},
 		{QCRMMaterialiser, 2, 2 * time.Second, 50, time.Second},
 		{QPaymentEvents, 4, 3 * time.Second, 20, time.Second},
 		{QFollowUp, 2, 5 * time.Second, 10, time.Second},

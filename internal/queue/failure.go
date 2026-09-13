@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"log/slog"
 	"runtime/debug"
+
+	"github.com/hibiken/asynq"
 )
 
 // Failure plumbing (T6.4 explicit failure events, T6.5 permanent-failure
@@ -140,4 +142,26 @@ func RunStage(ctx context.Context, log *slog.Logger, stage string, fn func(ctx c
 		return &StageError{Stage: stage, Err: err}
 	}
 	return nil
+}
+
+// discardError marks a failure as terminal AND frees the task's id: asynq
+// runs the ErrorHandler (so ReportFailure/Sentry still fire) and then deletes
+// the task instead of retrying or archiving it.
+//
+// Use it for fixed-TaskID debounce jobs. An archived task keeps its id
+// reserved, and asynq rejects any enqueue that reuses the id — so one failed
+// orchestrator run would otherwise silently swallow every later message from
+// that customer.
+type discardError struct{ err error }
+
+func (e *discardError) Error() string   { return e.err.Error() }
+func (e *discardError) Unwrap() []error { return []error{e.err, asynq.RevokeTask} }
+
+// Discard wraps err so the failed task is reported but neither retried nor
+// archived. A nil err stays nil.
+func Discard(err error) error {
+	if err == nil {
+		return nil
+	}
+	return &discardError{err: err}
 }

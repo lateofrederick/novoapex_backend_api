@@ -9,17 +9,12 @@ import (
 	"regexp"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/shopspring/decimal"
 
 	"github.com/novoapex/novoapex-backend-api/internal/queue"
 )
-
-// fuOutboundTaskType is the BullMQ job name the Node follow-up processor
-// enqueues under ('send' — follow-up.processor.ts:131), distinct from
-// 'send-message'. Preserved verbatim; today's outbound worker ignores bare
-// 'send' jobs, exactly as in source.
-const fuOutboundTaskType = "outbound-queue:send"
 
 // FollowUpPayload mirrors FollowUpJobData (schemas/follow-up.schema.ts).
 type FollowUpPayload struct {
@@ -27,15 +22,6 @@ type FollowUpPayload struct {
 	BusinessID string `json:"businessId"`
 	CustomerID string `json:"customerId"`
 	OrderID    string `json:"orderId"`
-}
-
-// fuOutboundJob is the follow-up enqueue body:
-// outboundQueue.add('send', {businessId, conversationId, recipientPhone, text}).
-type fuOutboundJob struct {
-	BusinessID     string `json:"businessId"`
-	ConversationID string `json:"conversationId"`
-	RecipientPhone string `json:"recipientPhone"`
-	Text           string `json:"text"`
 }
 
 // RegisterFollowUp wires the follow-up handler onto reg.
@@ -89,6 +75,7 @@ func HandleFollowUp(ctx context.Context, deps Deps, fp FollowUpPayload) error {
 
 	shouldSend := false
 	messageText := ""
+	isLatePaymentReminder := false
 	switch fp.JobType {
 	case "abandoned-cart":
 		if status == "CONFIRMED" {
@@ -98,11 +85,13 @@ func HandleFollowUp(ctx context.Context, deps Deps, fp FollowUpPayload) error {
 	case "unpaid-invoice-first":
 		if status == "PAYMENT_PENDING" || status == "CONFIRMED" {
 			shouldSend = true
+			isLatePaymentReminder = true
 			messageText = fmt.Sprintf("Hi %s, just a friendly reminder about your recent order for %s%s. Let us know if you need help with payment.", name, currencySymbol, formattedTotal)
 		}
 	case "unpaid-invoice-second":
 		if status == "PAYMENT_PENDING" || status == "CONFIRMED" {
 			shouldSend = true
+			isLatePaymentReminder = true
 			messageText = fmt.Sprintf("Hi %s, this is a final reminder for your order of %s%s. Your order will be cancelled soon if payment is not received.", name, currencySymbol, formattedTotal)
 		}
 	case "delivery-confirmation":
@@ -124,6 +113,18 @@ func HandleFollowUp(ctx context.Context, deps Deps, fp FollowUpPayload) error {
 		return nil
 	}
 
+	// Payment-behaviour signal: a reminder firing means the order was still
+	// unpaid at the scheduled deadline — a proxy for "needs a nudge to pay".
+	// Non-blocking: a failed CRM write must never stop the reminder itself.
+	if isLatePaymentReminder {
+		if _, ierr := pool.Exec(ctx,
+			`UPDATE customer_profiles SET late_payment_count = late_payment_count + 1, updated_at = CURRENT_TIMESTAMP WHERE customer_id = $1`,
+			fp.CustomerID); ierr != nil {
+			slog.WarnContext(ctx, "Failed to record late-payment signal (non-blocking)",
+				"customerId", fp.CustomerID, "error", ierr.Error())
+		}
+	}
+
 	var conversationID string
 	err = pool.QueryRow(ctx,
 		`SELECT id FROM conversations WHERE business_id = $1 AND customer_phone = $2`,
@@ -137,17 +138,38 @@ func HandleFollowUp(ctx context.Context, deps Deps, fp FollowUpPayload) error {
 		return fmt.Errorf("follow-up: conversation lookup: %w", err)
 	}
 
+	// Persist the OutboundMessage row BEFORE enqueueing — OutboundProcessor
+	// (the sole worker on outbound-queue) reads job.data.outboundMessageId and
+	// looks up the row; it does not accept a raw text payload. The previous
+	// version of this handler enqueued {businessId, conversationId,
+	// recipientPhone, text} directly, which nothing consumes — every
+	// follow-up message silently failed after retries despite this log line
+	// below claiming success. Fixed to match the pattern every other sender
+	// in this codebase already uses (payment_events.go sendPaymentConfirmation,
+	// orchestrator_context.go orchEnqueueOutboundText).
+	rawPayload, merr := json.Marshal(map[string]any{
+		"messaging_product": "whatsapp",
+		"type":              "text",
+		"text":              map[string]string{"body": messageText},
+	})
+	if merr != nil {
+		return fmt.Errorf("follow-up: marshal outbound payload: %w", merr)
+	}
+	outboundID := uuid.NewString()
+	if err := orchInsertOutboundRow(ctx, pool, outboundRow{
+		id: outboundID, businessID: fp.BusinessID, conversationID: conversationID,
+		messageType: "text", textContent: &messageText,
+		rawPayload: rawPayload, status: "pending",
+	}); err != nil {
+		return fmt.Errorf("follow-up: persist outbound row: %w", err)
+	}
+
 	if deps.Publisher == nil {
 		slog.WarnContext(ctx, "outbound publish skipped: no queue bridge wired (ADR 0001)",
 			"jobType", fp.JobType)
 		return nil
 	}
-	if err := deps.Publisher.Enqueue(ctx, queue.QOutbound, fuOutboundTaskType, fuOutboundJob{
-		BusinessID:     fp.BusinessID,
-		ConversationID: conversationID,
-		RecipientPhone: customerPhone,
-		Text:           messageText,
-	}, nil); err != nil {
+	if err := orchPublishOutbound(ctx, deps.Publisher, outboundID); err != nil {
 		return fmt.Errorf("follow-up: enqueue outbound: %w", err)
 	}
 

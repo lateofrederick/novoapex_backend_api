@@ -43,26 +43,43 @@ func TestS7A_FollowUp_MessageCopyGolden_AllFiveTypes(t *testing.T) {
 				t.Fatalf("publisher calls = %d, want 1", len(calls))
 			}
 			c := calls[0]
-			if c.Queue != queue.QOutbound || c.TaskType != fuOutboundTaskType {
-				t.Errorf("enqueue target = %s/%s, want %s/%s (source job name 'send')",
-					c.Queue, c.TaskType, queue.QOutbound, fuOutboundTaskType)
+			if c.Queue != queue.QOutbound || c.TaskType != queue.TaskOutboundSend {
+				t.Errorf("enqueue target = %s/%s, want %s/%s (OutboundProcessor's contract — a raw text payload is silently dropped)",
+					c.Queue, c.TaskType, queue.QOutbound, queue.TaskOutboundSend)
 			}
-			var job fuOutboundJob
+			var job outboundSendJob
 			if err := json.Unmarshal(c.Payload, &job); err != nil {
 				t.Fatalf("decode outbound job payload: %v", err)
 			}
-			if job.RecipientPhone != cust.Phone || job.BusinessID != biz.ID || job.ConversationID != conv.ID {
-				t.Errorf("job routing = %+v, want phone/conversation/business wired", job)
+			if job.OutboundMessageID == "" {
+				t.Fatalf("outboundMessageId missing from enqueue payload")
 			}
-			if strings.Contains(job.Text, "Fixture Customer") {
-				t.Errorf("customer name fallback failed: %q", job.Text)
+
+			// The row OutboundProcessor actually reads must exist BEFORE the
+			// job is enqueued (this is the bug being regression-tested).
+			var businessID, conversationID, recipientPhone, status, text string
+			if err := s.db.QueryRow(
+				`SELECT business_id, conversation_id, recipient_phone, status, text_content FROM outbound_messages WHERE id = $1`,
+				job.OutboundMessageID,
+			).Scan(&businessID, &conversationID, &recipientPhone, &status, &text); err != nil {
+				t.Fatalf("outbound_messages row not found for %s: %v", job.OutboundMessageID, err)
+			}
+			if recipientPhone != cust.Phone || businessID != biz.ID || conversationID != conv.ID {
+				t.Errorf("outbound row routing = phone=%s biz=%s conv=%s, want phone/conversation/business wired",
+					recipientPhone, businessID, conversationID)
+			}
+			if status != "pending" {
+				t.Errorf("outbound row status = %q, want %q", status, "pending")
+			}
+			if strings.Contains(text, "Fixture Customer") {
+				t.Errorf("customer name fallback failed: %q", text)
 			}
 
 			golden, _ := json.Marshal(map[string]any{
 				"businessId":     "{{businessId}}",
 				"conversationId": "{{conversationId}}",
 				"recipientPhone": "{{recipientPhone}}",
-				"text":           job.Text,
+				"text":           text,
 			})
 			harness.AssertJSONGolden(t, tc.golden, golden)
 		})
@@ -102,12 +119,13 @@ func TestS7A_FollowUp_CurrencySymbolFormatting(t *testing.T) {
 		if len(calls) != 1 {
 			t.Fatalf("%s: publisher calls = %d, want 1", tc.currency, len(calls))
 		}
-		var job fuOutboundJob
+		var job outboundSendJob
 		if err := json.Unmarshal(calls[0].Payload, &job); err != nil {
 			t.Fatalf("decode: %v", err)
 		}
-		if !strings.Contains(job.Text, tc.want+" ") && !strings.Contains(job.Text, "for "+tc.want+".") {
-			t.Errorf("%s: text %q missing formatted total %q", tc.currency, job.Text, tc.want)
+		text := s7a_scalar(t, s.db, `SELECT text_content FROM outbound_messages WHERE id = $1`, job.OutboundMessageID)
+		if !strings.Contains(text, tc.want+" ") && !strings.Contains(text, "for "+tc.want+".") {
+			t.Errorf("%s: text %q missing formatted total %q", tc.currency, text, tc.want)
 		}
 	}
 }

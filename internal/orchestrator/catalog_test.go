@@ -77,12 +77,7 @@ func catStart(t *testing.T) *catEnv {
 			catErr = err
 			return
 		}
-		repoDir, err := harness.NovoApexRepoDir()
-		if err != nil {
-			catErr = err
-			return
-		}
-		if err := harness.ApplyPrismaMigrations(bg, repoDir, env.PostgresDSN); err != nil {
+		if err := harness.ApplyBaselineSchema(bg, env.PostgresDSN); err != nil {
 			catErr = err
 			return
 		}

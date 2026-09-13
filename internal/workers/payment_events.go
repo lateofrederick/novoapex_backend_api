@@ -43,6 +43,7 @@ type Deps struct {
 
 	ReengagementThresholdMultiplier float64
 	ReengagementCooldownDays        int
+	NewArrivalsIntervalDays         int
 }
 
 // PaymentEventJob mirrors PaymentEventJobData (schemas/payment-event.schema.ts).
@@ -303,6 +304,18 @@ func HandlePaymentEvent(ctx context.Context, deps Deps, evt paystack.NormalisedP
 		"status", status,
 		"reconciled", orderID != "")
 
+	// Payment-behaviour signal: remember how this customer actually pays.
+	// Latest successful payment wins — same policy as sentiment/delivery_area
+	// in ProfileBuilderHandler. Non-blocking: never let this fail the webhook.
+	if customerID != "" && evt.Status == "success" && evt.AuthorizationBank != "" {
+		if _, perr := pool.Exec(ctx,
+			`UPDATE customer_profiles SET preferred_payment_network = $1, updated_at = CURRENT_TIMESTAMP WHERE customer_id = $2`,
+			evt.AuthorizationBank, customerID); perr != nil {
+			slog.WarnContext(ctx, "Failed to record preferred payment network (non-blocking)",
+				"customerId", customerID, "error", perr.Error())
+		}
+	}
+
 	if orderID != "" && evt.Status == "success" && customerID != "" {
 		if err := sendPaymentConfirmation(ctx, deps, confirmationInput{
 			businessID:  businessID,
@@ -435,8 +448,7 @@ func sendPaymentConfirmation(ctx context.Context, deps Deps, in confirmationInpu
 			"outboundMessageId", outboundID)
 		return nil
 	}
-	if err := deps.Publisher.Enqueue(ctx, queue.QOutbound, queue.TaskOutboundSend,
-		outboundSendJob{OutboundMessageID: outboundID}, nil); err != nil {
+	if err := queue.PublishOutbound(ctx, deps.Publisher, outboundID); err != nil {
 		slog.ErrorContext(ctx, "Failed to enqueue payment confirmation (row kept for outbox sweep)",
 			"outboundMessageId", outboundID,
 			"error", err.Error())

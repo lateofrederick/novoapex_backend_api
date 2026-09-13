@@ -49,6 +49,32 @@ func CRMSchemaJSON() []byte {
       ],
       "description": "Delivery location/area if the user mentioned it in this turn. Null if not mentioned."
     },
+    "fulfillment_choice": {
+      "anyOf": [
+        {
+          "type": "string",
+          "enum": [
+            "delivery",
+            "pickup"
+          ]
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "Whether the customer wants delivery or pickup. Populate this on the turn they choose it AND again on the confirmation turn (order_confirmed=true) — like detected_items, it must carry forward, not just appear once. Null if not yet addressed."
+    },
+    "pickup_location_id": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "The short ID (from [LOC: xxxxxxxx] in the PICKUP LOCATIONS section) of the location the customer selected. Only relevant when fulfillment_choice is \"pickup\" — must also carry forward onto the confirmation turn. Null otherwise."
+    },
     "customer_name": {
       "anyOf": [
         {
@@ -67,6 +93,17 @@ func CRMSchemaJSON() []byte {
       },
       "description": "Product categories or attributes the customer shows interest in (e.g. \"organic\", \"large size\", \"spicy\", \"hair products\"). Empty array if none detected in this turn."
     },
+    "wants_updates": {
+      "anyOf": [
+        {
+          "type": "boolean"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "True ONLY if the customer explicitly agrees to receive updates/notifications about new products or arrivals (e.g. \"yes please\", \"sure, keep me posted\", \"sign me up\") in direct response to being asked, or volunteers it unprompted. False ONLY if they explicitly decline such an offer. Null when the topic has not come up this turn — do NOT infer this from general enthusiasm about a product."
+    },
     "sentiment": {
       "type": "string",
       "enum": [
@@ -81,8 +118,11 @@ func CRMSchemaJSON() []byte {
     "order_confirmed",
     "detected_items",
     "delivery_area",
+    "fulfillment_choice",
+    "pickup_location_id",
     "customer_name",
     "detected_preferences",
+    "wants_updates",
     "sentiment"
   ],
   "additionalProperties": false,
@@ -178,6 +218,32 @@ func LLMSchemaJSON() []byte {
           ],
           "description": "Delivery location/area if the user mentioned it in this turn. Null if not mentioned."
         },
+        "fulfillment_choice": {
+          "anyOf": [
+            {
+              "type": "string",
+              "enum": [
+                "delivery",
+                "pickup"
+              ]
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Whether the customer wants delivery or pickup. Populate this on the turn they choose it AND again on the confirmation turn (order_confirmed=true) — like detected_items, it must carry forward, not just appear once. Null if not yet addressed."
+        },
+        "pickup_location_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The short ID (from [LOC: xxxxxxxx] in the PICKUP LOCATIONS section) of the location the customer selected. Only relevant when fulfillment_choice is \"pickup\" — must also carry forward onto the confirmation turn. Null otherwise."
+        },
         "customer_name": {
           "anyOf": [
             {
@@ -196,6 +262,17 @@ func LLMSchemaJSON() []byte {
           },
           "description": "Product categories or attributes the customer shows interest in (e.g. \"organic\", \"large size\", \"spicy\", \"hair products\"). Empty array if none detected in this turn."
         },
+        "wants_updates": {
+          "anyOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "True ONLY if the customer explicitly agrees to receive updates/notifications about new products or arrivals (e.g. \"yes please\", \"sure, keep me posted\", \"sign me up\") in direct response to being asked, or volunteers it unprompted. False ONLY if they explicitly decline such an offer. Null when the topic has not come up this turn — do NOT infer this from general enthusiasm about a product."
+        },
         "sentiment": {
           "type": "string",
           "enum": [
@@ -210,8 +287,11 @@ func LLMSchemaJSON() []byte {
         "order_confirmed",
         "detected_items",
         "delivery_area",
+        "fulfillment_choice",
+        "pickup_location_id",
         "customer_name",
         "detected_preferences",
+        "wants_updates",
         "sentiment"
       ],
       "additionalProperties": false,

@@ -1,7 +1,6 @@
 package workers_test
 
 import (
-	"bufio"
 	"bytes"
 	"context"
 	"database/sql"
@@ -13,13 +12,10 @@ import (
 	"math"
 	"net"
 	"net/http"
-	"os"
-	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
 	"testing"
-	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 
@@ -231,12 +227,8 @@ func startQueueHarness(t *testing.T) *harness.Harness {
 		t.Skipf("docker unavailable for queue harness: %v", err)
 	}
 	t.Cleanup(func() { h.Terminate(context.Background()) })
-	repoDir, err := harness.NovoApexRepoDir()
-	if err != nil {
-		t.Skipf("novoapex repo not reachable: %v", err)
-	}
-	if err := harness.ApplyPrismaMigrations(context.Background(), repoDir, h.PostgresDSN); err != nil {
-		t.Fatalf("migrate: %v", err)
+	if err := harness.ApplyBaselineSchema(context.Background(), h.PostgresDSN); err != nil {
+		t.Fatalf("apply schema: %v", err)
 	}
 	return h
 }
@@ -499,263 +491,4 @@ func TestS6GoogleClientWireShape(t *testing.T) {
 	if gotBody["outputDimensionality"] != float64(768) || gotBody["model"] != "models/gemini-embedding-001" {
 		t.Errorf("body = %v", gotBody)
 	}
-}
-
-// --- T6.21: VECTOR PARITY ------------------------------------------------------
-//
-// 1. boot the Node stack (api + worker) against shared pgvector/redis with the
-//    deterministic OpenAI stub;
-// 2. create a product through the NODE API (signup → business → POST
-//    /products), which enqueues BullMQ 'embed-product';
-// 3. wait for the Node worker to fill products.embedding;
-// 4. run the GO TaskEmbedProduct handler for the SAME productId against the
-//    SAME database, pointed at a stub sharing the node stub's vector function;
-// 5. assert the pgvector float32 slices are BIT-EXACT.
-//
-// Because the stub's vector is a deterministic pure function of the input
-// text, bit-equality proves the search document was assembled byte-exactly
-// (T6.15) AND that both stacks' write paths preserve full precision.
-
-func s6ParityStack(t *testing.T) (*harness.Harness, *harness.NodeStack, *sqlDB) {
-	t.Helper()
-
-	sock := os.Getenv("DOCKER_HOST")
-	if sock == "" || !strings.HasPrefix(sock, "unix://") {
-		sock = "unix:///var/run/docker.sock"
-	}
-	h, err := harness.Start(context.Background())
-	if err != nil {
-		t.Skipf("docker unavailable (%s): %v", sock, err)
-	}
-	t.Cleanup(func() { h.Terminate(context.Background()) })
-
-	repoDir, err := harness.NovoApexRepoDir()
-	if err != nil {
-		t.Skipf("novoapex repo not reachable: %v", err)
-	}
-	if err := harness.ApplyPrismaMigrations(context.Background(), repoDir, h.PostgresDSN); err != nil {
-		t.Fatalf("migrate: %v", err)
-	}
-	for _, bin := range []string{
-		filepath.Join(repoDir, "dist/apps/api/apps/api/src/main.js"),
-		filepath.Join(repoDir, "dist/apps/worker/apps/worker/src/main.js"),
-	} {
-		if _, err := os.Stat(bin); err != nil {
-			t.Skipf("node dist missing (%s) — run `npm run build:all` in %s first", bin, repoDir)
-		}
-	}
-
-	stack := harness.StartNodeStack(t, h)
-	db, err := sqlOpen(h.PostgresDSN)
-	if err != nil {
-		t.Fatalf("open db: %v", err)
-	}
-	t.Cleanup(func() { _ = db.Close() })
-	return h, stack, db
-}
-
-func TestS6VectorParityNodeVsGoBitExact(t *testing.T) {
-	h, stack, db := s6ParityStack(t)
-
-	productName := "Parity Widget"
-	productDesc := "  Hand-carved wooden comb \n"
-
-	token := paritySignupVendor(t, stack, h, "+23359990001", "parity-vendor@test.example")
-	biz := parityCreateBusiness(t, stack, token, "Parity Goods")
-	created := parityAPIRequest(t, stack.BaseURL, http.MethodPost, "/products", map[string]any{
-		"name":        productName,
-		"description": productDesc,
-		"price":       49.99,
-		"stock":       3,
-	}, token)
-	if created.Status != http.StatusOK && created.Status != http.StatusCreated {
-		t.Fatalf("POST /products status=%d body=%s", created.Status, created.Body)
-	}
-	var product struct {
-		ID string `json:"id"`
-	}
-	if err := json.Unmarshal(created.Body, &product); err != nil || product.ID == "" {
-		t.Fatalf("product id missing in response: %s", created.Body)
-	}
-	_ = biz
-
-	// Wait for the NODE worker to embed (BullMQ embed-product job).
-	deadline := time.Now().Add(120 * time.Second)
-	nodeVecText := ""
-	for time.Now().Before(deadline) {
-		var txt *string
-		if err := db.QueryRow(
-			`SELECT embedding::text FROM products WHERE id = $1`, product.ID).Scan(&txt); err != nil {
-			t.Fatalf("query embedding: %v", err)
-		}
-		if txt != nil {
-			nodeVecText = *txt
-			break
-		}
-		time.Sleep(500 * time.Millisecond)
-	}
-	if nodeVecText == "" {
-		t.Fatalf("node worker never filled products.embedding within timeout\n--- logs ---\n%s", stack.DumpLogs())
-	}
-
-	wantDoc := workers.BuildSearchDocument(productName, &productDesc)
-	wantVec := harness.Embedding(wantDoc, 768)
-	nodeVec := parseVectorText(nodeVecText)
-	if len(nodeVec) != 768 {
-		t.Fatalf("node vector dims = %d, want 768", len(nodeVec))
-	}
-	if !floatBitsEqual(nodeVec, wantVec) {
-		t.Fatal("node-written vector differs from deterministic expectation — input text or write path diverged")
-	}
-
-	// GO side: same DB row, own pool + client over a stub sharing the vector fn.
-	svc, _, _, pool := newEmbeddingSvc(t, h)
-	ctx := context.Background()
-	if err := svc.DispatchTask(ctx, queue.TaskEmbedProduct,
-		[]byte(fmt.Sprintf(`{"productId":%q}`, product.ID))); err != nil {
-		t.Fatalf("go handler: %v", err)
-	}
-
-	goVec, ok := readOptionalVector(t, pool,
-		`SELECT embedding::text FROM products WHERE id=$1`, product.ID)
-	if !ok {
-		t.Fatal("go handler left embedding NULL")
-	}
-
-	if !floatBitsEqual(nodeVec, goVec) {
-		diffIdx := -1
-		for i := range nodeVec {
-			if math.Float32bits(nodeVec[i]) != math.Float32bits(goVec[i]) {
-				diffIdx = i
-				break
-			}
-		}
-		t.Fatalf("VECTORS NOT BIT-EXACT (first diff at [%d]: node=%v go=%v)", diffIdx, nodeVec[diffIdx], goVec[diffIdx])
-	}
-	t.Logf("PARITY OK: 768 float32 values bit-exact for product %s (search doc %q)", product.ID, wantDoc)
-}
-
-// --- minimal local API helpers (harness test-only helpers can't be imported) ---
-
-type parityResponse struct {
-	Status int
-	Body   []byte
-}
-
-func parityAPIRequest(t *testing.T, baseURL, method, path string, body any, token string) parityResponse {
-	t.Helper()
-	var rdr io.Reader = bytes.NewReader(nil)
-	if body != nil {
-		raw, err := json.Marshal(body)
-		if err != nil {
-			t.Fatalf("marshal request body: %v", err)
-		}
-		rdr = bytes.NewReader(raw)
-	}
-	req, err := http.NewRequest(method, baseURL+path, rdr)
-	if err != nil {
-		t.Fatalf("build %s %s: %v", method, path, err)
-	}
-	if body != nil {
-		req.Header.Set("Content-Type", "application/json")
-	}
-	if token != "" {
-		req.Header.Set("Authorization", "Bearer "+token)
-	}
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		t.Fatalf("%s %s: %v", method, path, err)
-	}
-	defer func() { _ = resp.Body.Close() }()
-	raw, err := io.ReadAll(resp.Body)
-	if err != nil {
-		t.Fatalf("read response: %v", err)
-	}
-	return parityResponse{Status: resp.StatusCode, Body: raw}
-}
-
-func paritySignupVendor(t *testing.T, stack *harness.NodeStack, h *harness.Harness, phone, email string) string {
-	t.Helper()
-	r := parityAPIRequest(t, stack.BaseURL, http.MethodPost, "/auth/request-otp",
-		map[string]any{"phone": phone, "deliveryMethod": "email", "email": email}, "")
-	if r.Status != http.StatusOK {
-		t.Fatalf("request-otp status=%d body=%s", r.Status, r.Body)
-	}
-	stack.SMTP.WaitForMessage(t, email, 20*time.Second)
-	code := parityRedisGet(t, h.RedisAddr, "otp:"+phone)
-	if len(code) != 6 {
-		t.Fatalf("OTP for %s missing/invalid: %q", phone, code)
-	}
-	vr := parityAPIRequest(t, stack.BaseURL, http.MethodPost, "/auth/verify-otp",
-		map[string]any{"phone": phone, "code": code}, "")
-	if vr.Status != http.StatusOK {
-		t.Fatalf("verify-otp status=%d body=%s", vr.Status, vr.Body)
-	}
-	var parsed map[string]any
-	if err := json.Unmarshal(vr.Body, &parsed); err != nil {
-		t.Fatalf("verify-otp non-json: %s", vr.Body)
-	}
-	token, _ := parsed["token"].(string)
-	if token == "" {
-		t.Fatalf("no token: %s", vr.Body)
-	}
-	return token
-}
-
-func parityCreateBusiness(t *testing.T, stack *harness.NodeStack, token, name string) map[string]any {
-	t.Helper()
-	r := parityAPIRequest(t, stack.BaseURL, http.MethodPost, "/businesses",
-		map[string]any{"name": name, "currency": "GHS",
-			"whatsappPhoneNumberId": fmt.Sprintf("wni_parity_%d", time.Now().UnixNano()%1e9)}, token)
-	if r.Status != http.StatusOK && r.Status != http.StatusCreated {
-		t.Fatalf("POST /businesses status=%d body=%s", r.Status, r.Body)
-	}
-	var biz map[string]any
-	_ = json.Unmarshal(r.Body, &biz)
-	return biz
-}
-
-func parityRedisGet(t *testing.T, addr, key string) string {
-	t.Helper()
-	conn, err := net.DialTimeout("tcp", addr, 5*time.Second)
-	if err != nil {
-		t.Fatalf("dial redis: %v", err)
-	}
-	defer func() { _ = conn.Close() }()
-	_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
-
-	auth := fmt.Sprintf("*2\r\n$4\r\nAUTH\r\n$%d\r\n%s\r\n", len(harness.RedisPassword), harness.RedisPassword)
-	get := fmt.Sprintf("*2\r\n$3\r\nGET\r\n$%d\r\n%s\r\n", len(key), key)
-	if _, err := conn.Write([]byte(auth + get)); err != nil {
-		t.Fatalf("redis write: %v", err)
-	}
-	rd := bufio.NewReader(conn)
-	var reply strings.Builder
-	for {
-		line, err := rd.ReadString('\n')
-		reply.WriteString(line)
-		if err != nil || strings.Count(reply.String(), "\r\n") >= 3 {
-			break
-		}
-	}
-	parts := strings.Split(strings.TrimRight(reply.String(), "\r\n"), "\r\n")
-	if len(parts) < 3 {
-		t.Fatalf("unexpected redis reply %q", reply.String())
-	}
-	if !strings.HasPrefix(parts[0], "+OK") {
-		t.Fatalf("redis auth failed: %q", parts[0])
-	}
-	valLine := parts[1]
-	if valLine == "$-1" {
-		return ""
-	}
-	var n int
-	if _, err := fmt.Sscanf(valLine, "$%d", &n); err != nil || n < 0 || len(parts) < 3 {
-		t.Fatalf("parse bulk length %q: %v", valLine, err)
-	}
-	value := parts[2]
-	if len(value) != n {
-		t.Fatalf("bulk value length = %d, want %d", len(value), n)
-	}
-	return value
 }

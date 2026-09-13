@@ -21,6 +21,9 @@ const (
 const LevelFatal = slog.LevelError + 8
 const LevelTrace = slog.LevelDebug - 4
 
+// LevelSilent is above every emitted level: LOG_LEVEL=silent disables logs.
+const LevelSilent = LevelFatal + 4
+
 type LoggerConfig struct {
 	Level        string
 	Context      string
@@ -75,6 +78,8 @@ func ParseLogLevel(name string) slog.Leveler {
 		return slog.LevelError
 	case "fatal":
 		return LevelFatal
+	case "silent":
+		return LevelSilent
 	default:
 		return slog.LevelInfo
 	}

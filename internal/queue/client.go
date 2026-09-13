@@ -38,6 +38,28 @@ func NewClientWithLogger(redisAddr, redisPass string, log *slog.Logger) *AsynqCl
 	return c
 }
 
+// ClientConfig configures NewClientWithConfig.
+type ClientConfig struct {
+	RedisAddr string
+	RedisPass string
+	RedisTLS  bool // managed Redis (REDIS_TLS=true)
+	Logger    *slog.Logger
+}
+
+// NewClientWithConfig is NewClient with TLS support and an explicit logger.
+func NewClientWithConfig(cfg ClientConfig) *AsynqClient {
+	opt := asynq.RedisClientOpt{Addr: cfg.RedisAddr, Password: cfg.RedisPass}
+	if cfg.RedisTLS {
+		host, _, _ := splitHostPort(cfg.RedisAddr)
+		opt.TLSConfig = tlsConfigFor(host)
+	}
+	c := &AsynqClient{client: asynq.NewClient(opt), log: slog.Default()}
+	if cfg.Logger != nil {
+		c.log = cfg.Logger
+	}
+	return c
+}
+
 // Close releases the underlying redis connection pool.
 func (c *AsynqClient) Close() error { return c.client.Close() }
 

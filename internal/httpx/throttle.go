@@ -51,6 +51,9 @@ type throttleRecord struct {
 	expiresAt      time.Time
 	blockExpiresAt time.Time
 	blocked        bool
+	// gen invalidates pending decay timers on block reset
+	// (clearExpirationTimes) without retaining the timers themselves.
+	gen uint64
 }
 
 // Throttler is one named limit family (one Nest throttler entry).
@@ -62,7 +65,6 @@ type Throttler struct {
 
 	mu      sync.Mutex
 	storage map[string]*throttleRecord
-	timers  []*time.Timer // mirrors timeoutIds[name]: cleared on block reset
 }
 
 // NewThrottler builds a limiter for one logical route. name participates in
@@ -78,9 +80,22 @@ func NewThrottler(name string, limit int, window time.Duration) *Throttler {
 
 // Middleware applies the throttle before next.
 func (t *Throttler) Middleware(next http.Handler) http.Handler {
+	return t.middleware(next, func(*http.Request) string { return t.name })
+}
+
+// PerRouteMiddleware applies the throttle with one bucket per method+path per
+// client, approximating Nest's global ThrottlerGuard whose storage key embeds
+// the controller class and handler (every endpoint has its own budget).
+func (t *Throttler) PerRouteMiddleware(next http.Handler) http.Handler {
+	return t.middleware(next, func(r *http.Request) string {
+		return t.name + "-" + r.Method + " " + r.URL.Path
+	})
+}
+
+func (t *Throttler) middleware(next http.Handler, scope func(*http.Request) string) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		tracker := ThrottleTracker(r)
-		key := throttleStorageKey(t.name, tracker)
+		key := throttleStorageKey(scope(r), tracker)
 
 		totalHits, timeToExpire, timeToBlockExpire, blocked := t.increment(key)
 
@@ -120,7 +135,7 @@ func (t *Throttler) increment(key string) (totalHits, timeToExpire, timeToBlockE
 
 	if !rec.blocked {
 		rec.hits++
-		t.scheduleDecay(key) // setExpirationTime: this hit ages out after one window
+		t.scheduleDecay(key, rec.gen) // setExpirationTime: this hit ages out after one window
 	}
 
 	if rec.hits > t.limit && !rec.blocked {
@@ -136,34 +151,33 @@ func (t *Throttler) increment(key string) (totalHits, timeToExpire, timeToBlockE
 		// clearExpirationTimes — then fireHitCount for this request.
 		rec.blocked = false
 		rec.hits = 0
-		t.clearDecayTimersLocked()
+		rec.gen++ // clearExpirationTimes: earlier decay timers become no-ops
 		rec.hits++
-		t.scheduleDecay(key)
+		t.scheduleDecay(key, rec.gen)
 	}
 
 	return rec.hits, timeToExpire, timeToBlockExpire, rec.blocked
 }
 
-// scheduleDecay registers one -1 decrement a full window out. Mirrors
-// setExpirationTime's setTimeout, including its unconditional decrement.
-func (t *Throttler) scheduleDecay(key string) {
-	timer := time.AfterFunc(t.window, func() {
+// scheduleDecay registers one -1 decrement a full window out (mirrors
+// setExpirationTime's setTimeout). Timers are not retained, and a record whose
+// hits have fully decayed — with any block lapsed — is dropped, so memory stays
+// bounded by the set of currently active clients.
+func (t *Throttler) scheduleDecay(key string, gen uint64) {
+	time.AfterFunc(t.window, func() {
 		t.mu.Lock()
 		defer t.mu.Unlock()
-		if rec, ok := t.storage[key]; ok && rec.hits > 0 {
+		rec, ok := t.storage[key]
+		if !ok || rec.gen != gen {
+			return
+		}
+		if rec.hits > 0 {
 			rec.hits--
 		}
+		if rec.hits == 0 && (!rec.blocked || !time.Now().Before(rec.blockExpiresAt)) {
+			delete(t.storage, key)
+		}
 	})
-	t.timers = append(t.timers, timer)
-}
-
-// clearDecayTimersLocked mirrors clearExpirationTimes: every pending decay
-// timer for this throttler is dropped.
-func (t *Throttler) clearDecayTimersLocked() {
-	for _, tm := range t.timers {
-		tm.Stop()
-	}
-	t.timers = t.timers[:0]
 }
 
 func secondsUntil(at, now time.Time) int {

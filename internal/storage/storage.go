@@ -11,6 +11,7 @@ package storage
 import (
 	"context"
 	"log/slog"
+	"os"
 
 	"github.com/novoapex/novoapex-backend-api/internal/config"
 	"github.com/novoapex/novoapex-backend-api/internal/integrations/cloudinary"
@@ -43,6 +44,9 @@ func NewDefaultProvider(cfg *config.Config) StorageProvider {
 		CloudName: cfg.CloudinaryCloudName,
 		APIKey:    cfg.CloudinaryAPIKey,
 		APISecret: cfg.CloudinaryAPISecret,
+		// CLOUDINARY_BASE_URL overrides the API origin (tests / local stacks),
+		// like WHATSAPP_BASE_URL; empty keeps the production endpoint.
+		BaseURL: os.Getenv("CLOUDINARY_BASE_URL"),
 	})
 }
 

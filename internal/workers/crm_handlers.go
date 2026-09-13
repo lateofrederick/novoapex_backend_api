@@ -224,6 +224,68 @@ func crmHandleCustomerCapture(ctx context.Context, deps CRMDeps, customerID, new
 	return nil
 }
 
+// crmUpdateAcquisitionChannel ports CustomerCaptureHandler.updateAcquisitionChannel
+// (customer-capture.handler.ts): record where the customer came from, write-
+// once — only a NULL or 'organic' channel is replaced, so the first real
+// attribution sticks. Returns whether the channel changed.
+func crmUpdateAcquisitionChannel(ctx context.Context, pool *pgxpool.Pool, customerID, channel string) (bool, error) {
+	channel = strings.TrimSpace(channel)
+	if channel == "" {
+		return false, nil
+	}
+	tag, err := pool.Exec(ctx, `
+		UPDATE customers
+		   SET acquisition_channel = $2, updated_at = CURRENT_TIMESTAMP
+		 WHERE id = $1 AND (acquisition_channel IS NULL OR acquisition_channel = 'organic')`,
+		customerID, channel)
+	if err != nil {
+		return false, fmt.Errorf("crm: update acquisition channel: %w", err)
+	}
+	if tag.RowsAffected() == 0 {
+		return false, nil
+	}
+	slog.InfoContext(ctx, "Acquisition channel set", "customerId", customerID, "channel", channel)
+	return true, nil
+}
+
+// AcquisitionChannelFromReferral derives the channel recorded for a customer
+// from WhatsApp referral data (click-to-WhatsApp ads and posts, and QR/deep
+// links that carry a referral): "<source_type>:<source_id>", e.g.
+// "ad:120212345678" — or just the source type when Meta sends no id.
+func AcquisitionChannelFromReferral(referral map[string]any) string {
+	sourceType, _ := referral["source_type"].(string)
+	sourceID, _ := referral["source_id"].(string)
+	sourceType, sourceID = strings.TrimSpace(sourceType), strings.TrimSpace(sourceID)
+	switch {
+	case sourceType == "" && sourceID == "":
+		return "referral"
+	case sourceType == "":
+		return "referral:" + sourceID
+	case sourceID == "":
+		return sourceType
+	default:
+		return sourceType + ":" + sourceID
+	}
+}
+
+// crmHandleMarketingOptIn ports CustomerCaptureHandler.updateMarketingOptIn:
+// records explicit marketing consent (or its withdrawal) from the LLM's
+// wants_updates signal. This is the ONLY thing that gates a new-arrivals
+// digest send — WhatsApp policy requires documented opt-in for marketing
+// template messages, so a stale/wrong value here has real platform-policy
+// consequences, not just a UX one.
+func crmHandleMarketingOptIn(ctx context.Context, deps CRMDeps, customerID string, optedIn bool) error {
+	q := gen.New(deps.Pool)
+	if _, err := q.UpdateCustomerMarketingOptIn(ctx, gen.UpdateCustomerMarketingOptInParams{
+		MarketingOptIn: optedIn,
+		ID:             customerID,
+	}); err != nil {
+		return err
+	}
+	slog.Info("Marketing opt-in updated", "customerId", customerID, "optedIn", optedIn)
+	return nil
+}
+
 // ---------------------------------------------------------------------------
 // order-ledger.handler.ts
 // ---------------------------------------------------------------------------
@@ -249,6 +311,42 @@ type crmOrderItemRow struct { // orderItem.createMany payload row
 type crmStockEntry struct { // aggregated decrement entry
 	ID  string `json:"id"`
 	Qty int32  `json:"qty"`
+}
+
+// crmResolveFulfillment ports resolveFulfillment/resolvePickupLocation
+// (order-ledger.handler.ts). Defaults to DELIVERY whenever the customer
+// hasn't stated a pickup choice, and never blocks order creation: a pickup
+// choice whose location fails to resolve still returns PICKUP with a nil
+// locationId, logged as a warning rather than rejected.
+func crmResolveFulfillment(ctx context.Context, q *gen.Queries, businessID string, sig CrmSignals) (gen.FulfillmentType, pgtype.Text, error) {
+	if sig.FulfillmentChoice == nil || *sig.FulfillmentChoice != "pickup" {
+		return gen.FulfillmentTypeDELIVERY, pgtype.Text{}, nil
+	}
+
+	shortID := ""
+	if sig.PickupLocationID != nil {
+		shortID = *sig.PickupLocationID
+	}
+	if shortID == "" || !crmValidShortID.MatchString(shortID) {
+		slog.Warn("Pickup chosen but no valid location ID was provided — order created without a location",
+			"businessId", businessID)
+		return gen.FulfillmentTypePICKUP, pgtype.Text{}, nil
+	}
+
+	locID, err := q.ResolvePickupLocationByShortID(ctx, gen.ResolvePickupLocationByShortIDParams{
+		BusinessID: businessID,
+		ID:         crmEscapeLikePattern(shortID) + "%",
+	})
+	switch {
+	case errors.Is(err, pgx.ErrNoRows):
+		slog.Warn("Pickup location could not be resolved — order created without a location",
+			"businessId", businessID, "shortLocationId", shortID)
+		return gen.FulfillmentTypePICKUP, pgtype.Text{}, nil
+	case err != nil:
+		return "", pgtype.Text{}, err
+	}
+
+	return gen.FulfillmentTypePICKUP, pgtype.Text{String: locID, Valid: true}, nil
 }
 
 // crmHandleOrderLedger ports OrderLedgerHandler.handleOrderConfirmation
@@ -335,6 +433,15 @@ func crmHandleOrderLedger(ctx context.Context, deps CRMDeps, job CRMSignalJob) e
 		orderCurrency = business.Currency
 	}
 
+	// 2.5. Resolve fulfillment (order-ledger.handler.ts resolveFulfillment).
+	// Pickup with an unresolvable location still creates the order (as
+	// PICKUP, locationId nil) rather than blocking — consistent with how a
+	// partially-unresolvable item list still orders what it can, above.
+	fulfillmentType, locationID, fulErr := crmResolveFulfillment(ctx, q, job.BusinessID, job.CRMSignals)
+	if fulErr != nil {
+		return fulErr
+	}
+
 	// 3. Create Order + OrderItems + conditional stock decrement in ONE
 	// transaction (:139-207). The decrement is the sqlc-generated
 	// DecrementStockIfAvailable statement (T7.15 mandate): per-product
@@ -348,13 +455,15 @@ func crmHandleOrderLedger(ctx context.Context, deps CRMDeps, job CRMSignalJob) e
 		conversationID := crmText(job.ConversationID)
 		idempotencyKey := crmText(job.SourceMessageID)
 		if _, err := tq.InsertOrder(ctx, gen.InsertOrderParams{
-			ID:             orderID,
-			BusinessID:     job.BusinessID,
-			CustomerID:     job.CustomerID,
-			ConversationID: conversationID,
-			IdempotencyKey: idempotencyKey,
-			TotalAmount:    totalAmount,
-			Currency:       orderCurrency,
+			ID:              orderID,
+			BusinessID:      job.BusinessID,
+			CustomerID:      job.CustomerID,
+			ConversationID:  conversationID,
+			IdempotencyKey:  idempotencyKey,
+			TotalAmount:     totalAmount,
+			Currency:        orderCurrency,
+			FulfillmentType: fulfillmentType,
+			LocationID:      locationID,
 		}); err != nil {
 			return err
 		}
@@ -484,9 +593,7 @@ func crmHandleOrderLedger(ctx context.Context, deps CRMDeps, job CRMSignalJob) e
 			// Route through outbound-queue to guarantee ordering after the LLM
 			// reply (:279-299).
 			if deps.Publisher != nil {
-				if err := deps.Publisher.Enqueue(ctx, queue.QOutbound, queue.TaskOutboundSend, map[string]any{
-					"outboundMessageId": outboundMsg.ID,
-				}, nil); err != nil {
+				if err := queue.PublishOutbound(ctx, deps.Publisher, outboundMsg.ID); err != nil {
 					return err
 				}
 			}
@@ -531,8 +638,9 @@ func crmHandleOrderLedger(ctx context.Context, deps CRMDeps, job CRMSignalJob) e
 	}
 
 	// 6. Schedule follow-ups durably in the database (:340-367): abandoned-cart
-	// after 2h, first unpaid-invoice reminder after 24h. Errors are logged and
-	// swallowed — the order itself is already durable.
+	// after 2h, first unpaid-invoice reminder after 24h, second unpaid-invoice
+	// reminder after 48h. Errors are logged and swallowed — the order itself
+	// is already durable.
 	now := time.Now().UTC()
 	err := q.InsertScheduledFollowUpPair(ctx, gen.InsertScheduledFollowUpPairParams{
 		ID: crmNewID(), OrderID: orderID, BusinessID: job.BusinessID,
@@ -547,6 +655,12 @@ func crmHandleOrderLedger(ctx context.Context, deps CRMDeps, job CRMSignalJob) e
 		ScheduledAt_2: pgtype.Timestamp{Time: now.Add(24 * time.Hour), Valid: true},
 	})
 	if err != nil {
+		slog.Error("Failed to schedule follow-ups", "error", err.Error())
+	} else if err := q.InsertScheduledFollowUp(ctx, gen.InsertScheduledFollowUpParams{
+		ID: crmNewID(), OrderID: orderID, BusinessID: job.BusinessID,
+		CustomerID: job.CustomerID, JobType: "unpaid-invoice-second",
+		ScheduledAt: pgtype.Timestamp{Time: now.Add(48 * time.Hour), Valid: true},
+	}); err != nil {
 		slog.Error("Failed to schedule follow-ups", "error", err.Error())
 	}
 

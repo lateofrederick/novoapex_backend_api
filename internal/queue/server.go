@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/hibiken/asynq"
+	"github.com/redis/go-redis/v9"
 )
 
 // DefaultGracefulTimeout bounds how long Stop waits for in-flight tasks after
@@ -42,16 +43,17 @@ type QueuePolicy struct {
 }
 
 // builtinPolicies is the §B.2 table. orchestrator-queue has no retries
-// (terminal) and outbound-queue keeps the BullMQ default of a single attempt
-// until Stage 8c.
+// (terminal). outbound-queue retries transient Meta/network failures twice;
+// the consumer marks the row 'failed' once the budget is spent.
 var builtinPolicies = map[string]QueuePolicy{
 	QWebhookProcessing: {MaxRetry: 2, BackoffBase: 1 * time.Second, RateLimit: 100, RateWindow: 10 * time.Second},
 	QOrchestrator:      {MaxRetry: 0},
-	QOutbound:          {MaxRetry: 0, RateLimit: 50, RateWindow: 1 * time.Second},
+	QOutbound:          {MaxRetry: 2, BackoffBase: 2 * time.Second, RateLimit: 50, RateWindow: 1 * time.Second},
 	QCRMMaterialiser:   {MaxRetry: 2, BackoffBase: 2 * time.Second, RateLimit: 50, RateWindow: 1 * time.Second},
 	QPaymentEvents:     {MaxRetry: 4, BackoffBase: 3 * time.Second, RateLimit: 20, RateWindow: 1 * time.Second},
 	QFollowUp:          {MaxRetry: 2, BackoffBase: 5 * time.Second, RateLimit: 10, RateWindow: 1 * time.Second},
 	QEmbedding:         {MaxRetry: 2, BackoffBase: 2 * time.Second},
+	QExample:           {MaxRetry: 0}, // registered without defaultJobOptions: BullMQ's single attempt
 }
 
 func PolicyFor(queueName string) QueuePolicy {
@@ -86,6 +88,10 @@ type ServerConfig struct {
 	// shrink backoffs). Unknown queues keep PolicyFor's fallback.
 	Policies map[string]QueuePolicy
 
+	// Middleware, when set, wraps every task handler outermost (Sentry task
+	// transactions): it sees the task after panics became errors.
+	Middleware func(taskType string, next Handler) Handler
+
 	Logger *slog.Logger
 }
 
@@ -102,6 +108,7 @@ type Server struct {
 	policies    map[string]QueuePolicy
 	rdb         *rateLimiter
 	concurrency int
+	middleware  func(taskType string, next Handler) Handler
 }
 
 // NewServer builds the worker runtime. Run/Start must be called to begin
@@ -140,9 +147,13 @@ func NewServer(cfg ServerConfig) *Server {
 		Concurrency:     concurrency,
 		Queues:          queueWeights(merged),
 		ShutdownTimeout: graceful,
-		RetryDelayFunc:  retryDelay(merged),
-		ErrorHandler:    asynq.ErrorHandlerFunc(handleProcessingError(log)),
-		Logger:          asynqLogger{log: log},
+		// asynq forwards due scheduled/retry tasks on a poll (default 5s), which
+		// would stretch the 3s orchestrator debounce to 3–8s. BullMQ promotes
+		// delayed jobs at their due time; a 1s poll keeps replies close to that.
+		DelayedTaskCheckInterval: time.Second,
+		RetryDelayFunc:           retryDelay(merged),
+		ErrorHandler:             asynq.ErrorHandlerFunc(handleProcessingError(log)),
+		Logger:                   asynqLogger{log: log},
 	}
 
 	s := &Server{
@@ -152,6 +163,7 @@ func NewServer(cfg ServerConfig) *Server {
 		graceful:    graceful,
 		policies:    merged,
 		concurrency: concurrency,
+		middleware:  cfg.Middleware,
 	}
 	s.rdb = newRateLimiter(cfg.RedisAddr, cfg.RedisPass, cfg.RedisTLS, log)
 	return s
@@ -171,9 +183,9 @@ func queueWeights(policies map[string]QueuePolicy) map[string]int {
 
 // Register attaches a handler for taskType (implements Registrar).
 //
-// Wrapping order (outermost first): recover → rate limit → user handler, so a
-// panic anywhere — including limiter bookkeeping — is converted to an error
-// with a stack instead of taking down the worker goroutine (T6.7).
+// Wrapping order (outermost first): middleware → recover → rate limit → user
+// handler, so a panic anywhere — including limiter bookkeeping — is converted
+// to an error with a stack instead of taking down the worker goroutine (T6.7).
 func (s *Server) Register(taskType string, h Handler) {
 	queueName := QueueOf(taskType)
 	wrapped := h
@@ -181,9 +193,39 @@ func (s *Server) Register(taskType string, h Handler) {
 		wrapped = s.rateLimited(queueName, p)(wrapped)
 	}
 	wrapped = Recover(wrapped)
+	if s.middleware != nil {
+		wrapped = s.middleware(taskType, wrapped)
+	}
 	s.mux.HandleFunc(taskType, func(ctx context.Context, t *asynq.Task) error {
-		return wrapped(ctx, t.Payload())
+		return wrapped(context.WithValue(ctx, taskTypeKey{}, t.Type()), t.Payload())
 	})
+}
+
+type taskTypeKey struct{}
+
+// TaskInfo returns the running task's id and full type ("<queue>:<name>") —
+// BullMQ's job.id and job.name — from a handler context.
+func TaskInfo(ctx context.Context) (id, taskType string) {
+	id, _ = asynq.GetTaskID(ctx)
+	taskType, _ = ctx.Value(taskTypeKey{}).(string)
+	return id, taskType
+}
+
+// DeclareQueues records every queue in asynq's queue index so the dashboard
+// lists them all, including ones that have never received a job (Bull Board
+// showed every registered queue).
+func DeclareQueues(ctx context.Context, opt asynq.RedisConnOpt) error {
+	client := opt.MakeRedisClient()
+	rdb, ok := client.(redis.UniversalClient)
+	if !ok {
+		return fmt.Errorf("queue: unsupported redis client %T", client)
+	}
+	defer func() { _ = rdb.Close() }()
+	members := make([]any, 0, len(AllQueues()))
+	for _, q := range AllQueues() {
+		members = append(members, q)
+	}
+	return rdb.SAdd(ctx, "asynq:queues", members...).Err()
 }
 
 func (s *Server) policyFor(queueName string) QueuePolicy {

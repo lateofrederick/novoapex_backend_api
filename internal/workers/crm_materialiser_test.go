@@ -163,8 +163,11 @@ func TestS7b_TwoTurnHappyPath(t *testing.T) {
 		t.Errorf("customer_phone = %q, want %q", reqs[0].CustomerPhone, cust.Phone)
 	}
 
-	if got := s7bScalarInt(t, `SELECT COUNT(*) FROM scheduled_follow_ups WHERE order_id = $1`, orderID); got != 2 {
-		t.Errorf("scheduled follow-ups = %d, want 2", got)
+	if got := s7bScalarInt(t, `SELECT COUNT(*) FROM scheduled_follow_ups WHERE order_id = $1`, orderID); got != 3 {
+		t.Errorf("scheduled follow-ups = %d, want 3 (abandoned-cart +2h, unpaid-invoice-first +24h, unpaid-invoice-second +48h)", got)
+	}
+	if got := s7bScalarInt(t, `SELECT COUNT(*) FROM scheduled_follow_ups WHERE order_id = $1 AND job_type = 'unpaid-invoice-second'`, orderID); got != 1 {
+		t.Errorf("unpaid-invoice-second follow-ups = %d, want 1", got)
 	}
 }
 

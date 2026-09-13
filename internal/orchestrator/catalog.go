@@ -228,6 +228,73 @@ func GetSemanticCatalog(ctx context.Context, pool *pgxpool.Pool, oa *openai.Clie
 	return header + strings.Join(body, "\n") + "\n", nil // :219
 }
 
+// LocationRow is one active, pickup-enabled shop.
+type LocationRow struct {
+	ID          string
+	Name        string
+	Address     string
+	Landmark    *string
+	OpeningTime string
+	ClosingTime string
+}
+
+// FormatLocation renders one pickup location for the LLM.
+//
+// Output: `[LOC: abc12345] Main Street Shop — 12 Main Street (near the post office), open 08:00–18:00`
+func FormatLocation(l LocationRow) string {
+	landmark := ""
+	if l.Landmark != nil && *l.Landmark != "" {
+		landmark = " (near " + *l.Landmark + ")"
+	}
+	shortID := l.ID
+	if len(shortID) > 8 {
+		shortID = shortID[:8]
+	}
+	return "[LOC: " + shortID + "] " + l.Name + " — " + l.Address + landmark +
+		", open " + l.OpeningTime + "–" + l.ClosingTime
+}
+
+// GetPickupLocationsContext ports getPickupLocationsContext
+// (catalog-retriever.service.ts): active, pickup-enabled shops for a
+// business, formatted for the LLM to present once the customer says they
+// want to pick up. Returns "" when the business has none configured — a
+// delivery-only business must never see pickup offered as an option.
+func GetPickupLocationsContext(ctx context.Context, pool *pgxpool.Pool, businessID string) (string, error) {
+	rows, err := pool.Query(ctx, `
+		SELECT id, name, address, landmark, opening_time, closing_time
+		FROM business_locations
+		WHERE business_id = $1 AND offers_pickup = true AND is_active = true
+		ORDER BY name ASC;`, businessID)
+	if err != nil {
+		return "", fmt.Errorf("orchestrator: pickup locations for business %s: %w", businessID, err)
+	}
+	defer rows.Close()
+
+	var locations []LocationRow
+	for rows.Next() {
+		var l LocationRow
+		var landmark *string
+		if err := rows.Scan(&l.ID, &l.Name, &l.Address, &landmark, &l.OpeningTime, &l.ClosingTime); err != nil {
+			return "", fmt.Errorf("orchestrator: scan pickup location: %w", err)
+		}
+		l.Landmark = landmark
+		locations = append(locations, l)
+	}
+	if err := rows.Err(); err != nil {
+		return "", fmt.Errorf("orchestrator: pickup location rows: %w", err)
+	}
+
+	if len(locations) == 0 {
+		return "", nil
+	}
+
+	body := make([]string, len(locations))
+	for i, l := range locations {
+		body[i] = FormatLocation(l)
+	}
+	return "\n=== PICKUP LOCATIONS ===\n" + strings.Join(body, "\n") + "\n", nil
+}
+
 // FormatFaqs ports searchFaqs' result formatting (:131-140).
 func FormatFaqs(faqs []FAQHit) string {
 	result := "\n=== POLICIES & FAQs ===\n"
@@ -343,6 +410,14 @@ func ContextForBusiness(ctx context.Context, deps RetrieverDeps, args ContextArg
 		return fail(err)
 	}
 	contextString.WriteString(FormatFaqs(faqs))
+
+	// 3.5. Pickup locations, if the business has any configured. Omitted
+	// entirely (not just "none found") for a delivery-only business.
+	locationsCtx, err := GetPickupLocationsContext(ctx, deps.Pool, args.BusinessID)
+	if err != nil {
+		return fail(err)
+	}
+	contextString.WriteString(locationsCtx)
 
 	if args.CustomerImageEmbedding != nil { // :62-65 — a customer image was supplied
 		contextString.WriteString(GetImageContext(ctx, deps.Pool, args.BusinessID, args.CustomerImageEmbedding, args.Currency))

@@ -7,6 +7,7 @@
 //  1. always update profile (accumulate preferences, sentiment, delivery area)
 //  2. if order confirmed → create Order + OrderItems (+ invoice + follow-ups)
 //  3. if customer name detected → update Customer name
+//  4. if marketing opt-in/decline stated → update Customer.marketingOptIn
 //
 // Core logic lives in pure funcs (HandleCRMSignals and the crm* handlers in
 // crm_handlers.go) so tests exercise them directly without asynq.
@@ -88,8 +89,11 @@ type CrmSignals struct {
 	OrderConfirmed      bool           `json:"order_confirmed"`
 	DetectedItems       []DetectedItem `json:"detected_items"`
 	DeliveryArea        *string        `json:"delivery_area"`
+	FulfillmentChoice   *string        `json:"fulfillment_choice"` // "delivery" | "pickup" | nil
+	PickupLocationID    *string        `json:"pickup_location_id"`
 	CustomerName        *string        `json:"customer_name"`
 	DetectedPreferences []string       `json:"detected_preferences"`
+	WantsUpdates        *bool          `json:"wants_updates"`
 	Sentiment           *string        `json:"sentiment"`
 }
 
@@ -139,6 +143,15 @@ func HandleCRMSignals(ctx context.Context, deps CRMDeps, job CRMSignalJob) error
 	if job.CRMSignals.CustomerName != nil {
 		if err := runCRMStage("customer_capture", func() error {
 			return crmHandleCustomerCapture(ctx, deps, job.CustomerID, *job.CRMSignals.CustomerName)
+		}); err != nil {
+			return err
+		}
+	}
+
+	// 4. If marketing opt-in/decline was explicitly stated, record it
+	if job.CRMSignals.WantsUpdates != nil {
+		if err := runCRMStage("marketing_opt_in", func() error {
+			return crmHandleMarketingOptIn(ctx, deps, job.CustomerID, *job.CRMSignals.WantsUpdates)
 		}); err != nil {
 			return err
 		}

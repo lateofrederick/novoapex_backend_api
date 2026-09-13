@@ -13,12 +13,13 @@ import (
 	"github.com/novoapex/novoapex-backend-api/internal/queue"
 )
 
-func TestS7A_CronSpecs_ThreeSingletonCrons(t *testing.T) {
+func TestS7A_CronSpecs_FourSingletonCrons(t *testing.T) {
 	specs := CronSpecs()
 	want := []struct{ spec, cron string }{
 		{"follow-up-scanner", "*/1 * * * *"},
 		{"outbox-sweep", "*/2 * * * *"},
 		{"retention-scanner", "0 9 * * *"},
+		{"new-arrivals-scanner", "0 8 * * *"},
 	}
 	if len(specs) != len(want) {
 		t.Fatalf("specs = %d, want %d", len(specs), len(want))
@@ -220,8 +221,8 @@ func TestS7A_OutboxSweep_ReenqueuesStrandedOnly(t *testing.T) {
 	if job.OutboundMessageID != stranded {
 		t.Errorf("re-enqueued id = %s, want stranded %s", job.OutboundMessageID, stranded)
 	}
-	if c.Opts == nil || c.Opts.TaskID != "outbox-sweep:"+stranded {
-		t.Errorf("TaskID = %+v, want outbox-sweep:<id>", c.Opts)
+	if c.Opts == nil || c.Opts.TaskID != queue.OutboundTaskID(stranded) {
+		t.Errorf("TaskID = %+v, want %s", c.Opts, queue.OutboundTaskID(stranded))
 	}
 	for _, id := range []string{recent, sent} {
 		if status := s7a_scalar(t, s.db, `SELECT status FROM outbound_messages WHERE id = $1`, id); status != "pending" && status != "sent" {

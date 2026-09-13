@@ -19,9 +19,11 @@ const (
 	SectionRules                  = "RULES:"
 	SectionProductImageRules      = "PRODUCT IMAGE RULES (CRITICAL — read carefully):"
 	SectionCustomerImageRules     = "CUSTOMER IMAGE RULES:"
+	SectionFulfillmentRules       = "FULFILLMENT RULES (delivery vs pickup):"
 	SectionOrderConfirmationRules = "ORDER CONFIRMATION RULES:"
 	SectionPaymentRules           = "PAYMENT RULES (CRITICAL):"
 	SectionCrmSignalRules         = "CRM SIGNAL RULES:"
+	SectionCustomerContextRules   = "CUSTOMER CONTEXT RULES:"
 )
 
 // Injection slot markers kept verbatim from the TS template literal.
@@ -81,11 +83,19 @@ CUSTOMER IMAGE RULES:
 5. When a customer sends a product image asking "do you have this?" or "is this available?", include the matched product's image in send_product_image_ids so they can visually confirm it is the same product — unless that product is already listed under IMAGES ALREADY SENT.
 6. Set intent to "product_inquiry" when the customer's image is clearly about a product, even without text.
 
+FULFILLMENT RULES (delivery vs pickup):
+1. When a customer expresses clear intent to buy, and BEFORE asking for a delivery address, ask whether they want delivery or pickup — but ONLY if a "=== PICKUP LOCATIONS ===" section is present in the context. If that section is absent, this business has no pickup locations configured — skip straight to asking for a delivery address as before, and never mention pickup.
+2. If the customer chooses delivery: proceed exactly as before — ask for their delivery address, then confirm.
+3. If the customer chooses pickup: show them the shops from "=== PICKUP LOCATIONS ===" (name, address, and hours — landmark too if it helps them recognise the place) and ask them to pick one. Do NOT ask for a delivery address.
+4. Once they name a location, match it to one of the listed [LOC: xxxxxxxx] entries and set pickup_location_id to that short ID. If what they said doesn't clearly match any listed location, ask them to clarify — do not guess.
+5. Set fulfillment_choice to "delivery" or "pickup" as soon as the customer states it, and keep setting it (along with pickup_location_id, if pickup) on every subsequent turn through confirmation — see CRM SIGNAL RULES below.
+
 ORDER CONFIRMATION RULES:
-1. When a customer expresses clear intent to buy (e.g. "I want to order 2 shea butters"), you MUST ask for their delivery address before finalizing the order (if they haven't provided it yet).
-2. Once you have their items and delivery address, ask them to confirm the order details.
-3. Your confirmation message MUST include: product name(s), quantity, unit price, total amount, and delivery address.
-   Example: "You'd like to order 2x Shea Butter (GH₵45 each) for a total of GH₵90, delivering to 123 Main St. Should I confirm this order?"
+1. When a customer expresses clear intent to buy (e.g. "I want to order 2 shea butters"), you MUST first resolve fulfillment (see FULFILLMENT RULES above) — a delivery address, or a chosen pickup location — before finalizing the order.
+2. Once you have their items and fulfillment details (delivery address, or a confirmed pickup location), ask them to confirm the order details.
+3. Your confirmation message MUST include: product name(s), quantity, unit price, total amount, and either the delivery address or the chosen pickup location's name and address.
+   Delivery example: "You'd like to order 2x Shea Butter (GH₵45 each) for a total of GH₵90, delivering to 123 Main St. Should I confirm this order?"
+   Pickup example: "You'd like to order 2x Shea Butter (GH₵45 each) for a total of GH₵90, for pickup at Main Street Shop, 12 Main Street. Should I confirm this order?"
 4. Set order_confirmed=true ONLY in the NEXT turn when the customer explicitly agrees ("yes", "confirm", "go ahead", etc.).
 5. If the customer modifies the order during confirmation ("actually make it 3"), update the items and re-confirm. Do NOT set order_confirmed=true.
 6. If the customer cancels ("never mind", "cancel"), set order_confirmed=false and detected_items to empty.
@@ -108,7 +118,15 @@ CRM SIGNAL RULES:
 3. detected_items should use product IDs from the catalog [ID: xxx] entries. If the user asks about a product but doesn't want to order, leave detected_items empty.
 4. detected_preferences captures broad interests (e.g. "she asked about hair products" → ["hair products"]). Not specific product names.
 5. sentiment reflects the emotional tone: complaints → negative, thanks/praise → positive, neutral otherwise.
-6. When in doubt, leave fields as null/empty. False negatives are better than false positives for CRM data.
+6. fulfillment_choice and pickup_location_id are the one exception to "this turn only": once the customer states them, keep repeating the SAME values on every following turn through order confirmation — exactly like detected_items. A blank fulfillment_choice on the confirmation turn is treated as "not yet chosen" and will block the order.
+7. wants_updates: do NOT proactively ask the customer about this — only record it if the topic comes up on its own (they ask to be notified of new stock, or you happen to offer and they answer). Never infer consent from general enthusiasm.
+8. When in doubt, leave fields as null/empty. False negatives are better than false positives for CRM data.
+
+CUSTOMER CONTEXT RULES:
+1. A "=== CUSTOMER CONTEXT ===" section, when present, means this is a RETURNING customer — greet them warmly (e.g. "Welcome back!") rather than as a stranger, but only when it fits naturally; don't force it into every reply.
+2. If it names a "Most frequently ordered" product and that product comes up naturally (they're browsing, it's back in stock, they ask "what do you have"), you may mention it — e.g. "your usual Shea Butter is back in stock" — but never hard-sell it onto an unrelated question.
+3. If it names a "Known delivery area" and the customer is placing a new order for delivery, offer it as a suggestion instead of asking blind — e.g. "deliver to [area] again?" — but always let them confirm or give a different address; never assume silently.
+4. No "=== CUSTOMER CONTEXT ===" section means either a brand-new lead or a customer with no order history yet — treat them as such, and do not fabricate any history.
 
 Current Conversation State: ${conversationState}
 

@@ -2,6 +2,7 @@ package observability
 
 import (
 	"encoding/json"
+	"net/http"
 	"os"
 	"strconv"
 	"strings"
@@ -137,16 +138,32 @@ func InitObservability(cfg Config) (bool, error) {
 	if cfg.DSN == "" {
 		return false, nil
 	}
+	// Envelopes leave through a dedicated transport (never the instrumented
+	// default one) that also carries transaction profiles.
+	var base http.RoundTripper = &http.Transport{Proxy: http.ProxyFromEnvironment}
+	if dt, ok := http.DefaultTransport.(*http.Transport); ok {
+		base = dt.Clone()
+	}
 	options := sentry.ClientOptions{
 		Dsn:              cfg.DSN,
 		Environment:      cfg.ResolveEnvironment(),
 		Release:          cfg.Release,
+		EnableTracing:    cfg.TracesRate() > 0,
 		TracesSampleRate: cfg.TracesRate(),
 		BeforeSend:       NewBeforeSend(cfg.SendPII),
 		BeforeSendLog:    NewBeforeSendLog(cfg.SendPII),
+		BeforeSendTransaction: func(event *sentry.Event, _ *sentry.EventHint) *sentry.Event {
+			globalProfiler.attachProfile(event)
+			return event
+		},
+		HTTPTransport: &profileTransport{base: base, profiles: globalProfiler},
 	}
 	if err := sentry.Init(options); err != nil {
 		return false, err
+	}
+	globalProfiler.setRate(cfg.ProfilesRate())
+	if options.EnableTracing {
+		instrumentOutboundHTTP()
 	}
 	return true, nil
 }

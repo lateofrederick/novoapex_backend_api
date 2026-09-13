@@ -69,12 +69,8 @@ func s7a_startStack(t *testing.T) *s7a_stack {
 	}
 	t.Cleanup(func() { h.Terminate(context.Background()) })
 
-	repoDir, err := harness.NovoApexRepoDir()
-	if err != nil {
-		t.Skipf("novoapex repo not reachable: %v", err)
-	}
-	if err := harness.ApplyPrismaMigrations(ctx, repoDir, h.PostgresDSN); err != nil {
-		t.Fatalf("prisma migrate deploy: %v", err)
+	if err := harness.ApplyBaselineSchema(ctx, h.PostgresDSN); err != nil {
+		t.Fatalf("apply schema: %v", err)
 	}
 
 	db, err := sql.Open("pgx", h.PostgresDSN)

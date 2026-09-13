@@ -4,6 +4,8 @@ import (
 	"encoding/json"
 	"net/http"
 	"strings"
+
+	"github.com/novoapex/novoapex-backend-api/internal/errreport"
 )
 
 // FieldIssue carries the universal fields of a raw ZodIssue
@@ -38,6 +40,8 @@ func WriteZodValidationError(w http.ResponseWriter, issues []FieldIssue) {
 			Message: i.Message,
 		})
 	}
+
+	errreport.Report(w, &errreport.Exception{Name: "ZodValidationException", Status: http.StatusBadRequest, Message: "Validation failed"})
 
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusBadRequest)

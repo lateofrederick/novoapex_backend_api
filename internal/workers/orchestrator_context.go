@@ -8,6 +8,7 @@ package workers
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"regexp"
@@ -16,6 +17,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/shopspring/decimal"
 
@@ -248,8 +250,7 @@ func orchInsertOutboundRow(ctx context.Context, pool *pgxpool.Pool, r outboundRo
 }
 
 func orchPublishOutbound(ctx context.Context, pub queue.Publisher, outboundMessageID string) error {
-	return pub.Enqueue(ctx, queue.QOutbound, queue.TaskOutboundSend,
-		map[string]string{"outboundMessageId": outboundMessageID}, nil)
+	return queue.PublishOutbound(ctx, pub, outboundMessageID)
 }
 
 func orchWithin24hWindow(ctx context.Context, pool *pgxpool.Pool, conversationID string) (bool, error) {
@@ -317,8 +318,11 @@ func orchCRMSignalJob(oc orchContext, latest *orchLatest, resp orchestrator.LlmR
 			OrderConfirmed:      resp.CrmSignals.OrderConfirmed,
 			DetectedItems:       items,
 			DeliveryArea:        deliveryArea,
+			FulfillmentChoice:   resp.CrmSignals.FulfillmentChoice,
+			PickupLocationID:    resp.CrmSignals.PickupLocationID,
 			CustomerName:        customerName,
 			DetectedPreferences: resp.CrmSignals.DetectedPreferences,
+			WantsUpdates:        resp.CrmSignals.WantsUpdates,
 			Sentiment:           &sentiment,
 		},
 		LLMIntent:            resp.Intent,
@@ -369,6 +373,65 @@ func orchCurrencyFor(code string) orchCurrencyDisplay {
 	return orchCurrencyConfigs["GHS"] // getCurrencyConfig fallback (:38)
 }
 
+// orchFavoriteProduct ports getFavoriteProduct
+// (conversation-orchestrator.service.ts): the product this customer has
+// bought the most of, by total quantity across their order history. Uses the
+// immutable order_items.product_name snapshot rather than joining to the
+// live product row, so a since-renamed or deleted product still resolves to
+// what the customer actually bought. Only worth calling for a returning
+// customer — callers gate this on profileTotalOrders > 0.
+func orchFavoriteProduct(ctx context.Context, pool *pgxpool.Pool, customerID string) (string, error) {
+	var name string
+	err := pool.QueryRow(ctx, `
+		SELECT oi.product_name
+		FROM order_items oi
+		JOIN orders o ON o.id = oi.order_id
+		WHERE o.customer_id = $1
+		GROUP BY oi.product_name
+		ORDER BY SUM(oi.quantity) DESC
+		LIMIT 1;`, customerID).Scan(&name)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return "", nil
+	}
+	if err != nil {
+		return "", fmt.Errorf("orchestrator: favorite product for customer %s: %w", customerID, err)
+	}
+	return name, nil
+}
+
+// orchBuildCustomerContext ports buildCustomerContext
+// (conversation-orchestrator.service.ts): renders accumulated CRM profile
+// data as context for the LLM, so the "stealth CRM" actually personalises
+// replies instead of just recording data nobody reads.
+//
+// The name line is independent of order history — a lead who introduced
+// themselves but hasn't ordered yet should still be greeted by name. The
+// order-history lines (order count, favorite product, delivery area) stay
+// gated on profileTotalOrders > 0, since there is nothing there to report
+// otherwise. Empty only when neither a name nor any order history is known.
+func orchBuildCustomerContext(oc orchContext, favoriteProduct string) string {
+	isReturning := oc.profileTotalOrders > 0
+	if oc.customerName == "" && !isReturning {
+		return ""
+	}
+
+	var lines []string
+	if oc.customerName != "" {
+		lines = append(lines, "Name: "+oc.customerName+".")
+	}
+	if isReturning {
+		lines = append(lines, fmt.Sprintf("Returning customer — %d previous order(s).", oc.profileTotalOrders))
+		if favoriteProduct != "" {
+			lines = append(lines, "Most frequently ordered: "+favoriteProduct+".")
+		}
+		if oc.profileDeliveryArea != "" {
+			lines = append(lines, "Known delivery area: "+oc.profileDeliveryArea+".")
+		}
+	}
+
+	return "\n=== CUSTOMER CONTEXT ===\n" + strings.Join(lines, "\n") + "\n"
+}
+
 func ptr[T any](v T) *T { return &v }
 
 func orchDeref(s *string, fallback string) string {
@@ -406,11 +469,14 @@ func TranscriptWebhookDriver(orch OrchestratorDeps, crm CRMDeps) func(ctx contex
 		deps := orch
 		deps.Publisher = capture
 		job := OrchestratorJob{RecipientPhone: recipient, SenderPhone: msg.from}
-		startedAt := time.Now()
+		mark, err := inboundMark(ctx, deps.Pool, job)
+		if err != nil {
+			return err
+		}
 		if err := HandleDebouncedConversation(ctx, deps, job); err != nil {
 			return err
 		}
-		if err := reenqueueIfNewerInbound(ctx, deps, job, startedAt); err != nil {
+		if err := reenqueueIfNewerInbound(ctx, deps, job, mark); err != nil {
 			return err
 		}
 		for _, j := range capture.drain() {

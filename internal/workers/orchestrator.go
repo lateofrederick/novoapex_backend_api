@@ -37,6 +37,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/novoapex/novoapex-backend-api/internal/domain"
@@ -131,34 +132,52 @@ func RegisterOrchestrator(reg queue.Registrar, deps OrchestratorDeps) {
 		if err := json.Unmarshal(payload, &job); err != nil {
 			return fmt.Errorf("orchestrator: decode job payload: %w", err)
 		}
-		// startedAt BEFORE processing (processor.ts:29-32): anything persisted
-		// after this instant arrived while we were busy.
-		startedAt := time.Now()
+		// Mark BEFORE processing (processor.ts:29-32): anything persisted after
+		// this point arrived while we were busy.
+		mark, markErr := inboundMark(ctx, deps.Pool, job)
 		if err := HandleDebouncedConversation(ctx, deps, job); err != nil {
 			slog.Error("Orchestrator failed to handle debounced conversation",
 				"event", "orchestrator_job_failed",
 				"recipientPhone", job.RecipientPhone,
 				"senderPhone", job.SenderPhone,
 				"err", err)
-			return err // terminal — §B.2 QOrchestrator policy MaxRetry:0
+			// Terminal (§B.2 QOrchestrator MaxRetry:0). Discard rather than
+			// archive: the archived task would keep the fixed debounce id
+			// reserved and drop every later message from this customer.
+			return queue.Discard(err)
 		}
-		return reenqueueIfNewerInbound(ctx, deps, job, startedAt)
+		if markErr != nil {
+			slog.Warn("Failed to snapshot inbound messages before processing; skipping completion re-check (non-blocking)",
+				"event", "orchestrator_reenqueue_check_failed", "err", markErr)
+			return nil
+		}
+		return reenqueueIfNewerInbound(ctx, deps, job, mark)
 	})
+}
+
+// inboundMark counts the conversation's persisted inbound messages. Rows are
+// never deleted, so a higher count after the run means messages landed while
+// it was busy.
+//
+// The source compared created_at against the processor's wall clock; that
+// breaks whenever the worker and database clocks drift (spurious duplicate
+// runs, or silently missed messages), and misses rows committed late with an
+// earlier created_at. A count is immune to both.
+func inboundMark(ctx context.Context, pool *pgxpool.Pool, job OrchestratorJob) (int64, error) {
+	var n int64
+	err := pool.QueryRow(ctx,
+		`SELECT count(*) FROM inbound_messages WHERE sender_phone = $1 AND recipient_phone = $2`,
+		job.SenderPhone, job.RecipientPhone).Scan(&n)
+	return n, err
 }
 
 // reenqueueIfNewerInbound ports reenqueueIfNewerMessages
 // (orchestrator.processor.ts:63-106): close the debounce drop-window by
 // scheduling one more pass under a FRESH timestamped task id when messages
 // landed during processing. Errors are swallowed non-fatally (:97-105).
-func reenqueueIfNewerInbound(ctx context.Context, deps OrchestratorDeps, job OrchestratorJob, startedAt time.Time) error {
-	var newer bool
-	// Epoch-millis comparison: pgx encodes untyped time.Time params as naive
-	// local wall time, which skews against the server's UTC-naive created_at;
-	// to_timestamp($3/1000.0) is timezone-immune.
-	err := deps.Pool.QueryRow(ctx,
-		`SELECT EXISTS(SELECT 1 FROM inbound_messages
-		 WHERE sender_phone = $1 AND recipient_phone = $2 AND created_at > to_timestamp($3 / 1000.0))`,
-		job.SenderPhone, job.RecipientPhone, startedAt.UnixMilli()).Scan(&newer)
+func reenqueueIfNewerInbound(ctx context.Context, deps OrchestratorDeps, job OrchestratorJob, mark int64) error {
+	current, err := inboundMark(ctx, deps.Pool, job)
+	newer := current > mark
 	if err != nil {
 		slog.Warn("Failed to re-check for messages arriving during processing (non-blocking)",
 			"event", "orchestrator_reenqueue_check_failed",
@@ -199,6 +218,11 @@ type orchContext struct {
 	conversationID string
 	state          domain.ConversationState
 	escalated      bool
+
+	// Stealth-CRM personalisation context (Node buildCustomerContext port).
+	customerName        string
+	profileTotalOrders  int
+	profileDeliveryArea string
 }
 
 // HandleDebouncedConversation runs one debounced turn through every phase of
@@ -257,16 +281,28 @@ func orchResolveConversationContext(ctx context.Context, pool *pgxpool.Pool, rec
 	// upsert-race shield the source cites (:340-342). CURRENT_TIMESTAMP keeps
 	// the three stamps on the DB clock (same statement ⇒ same instant).
 	oc.customerID = uuid.NewString()
+	var custName, channel pgtype.Text
 	err = pool.QueryRow(ctx,
 		`INSERT INTO customers
 		   (id, business_id, phone, acquisition_channel, first_contact_at, last_contact_at, updated_at)
 		 VALUES ($1, $2, $3, 'organic', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
 		 ON CONFLICT (business_id, phone)
 		 DO UPDATE SET last_contact_at = EXCLUDED.last_contact_at, updated_at = CURRENT_TIMESTAMP
-		 RETURNING id`,
-		oc.customerID, oc.businessID, senderPhone).Scan(&oc.customerID)
+		 RETURNING id, name, acquisition_channel`,
+		oc.customerID, oc.businessID, senderPhone).Scan(&oc.customerID, &custName, &channel)
 	if err != nil {
 		return oc, false, fmt.Errorf("orchestrator: upsert customer: %w", err)
+	}
+	if custName.Valid {
+		oc.customerName = custName.String
+	}
+	// Acquisition attribution: the customer's first message that carried a
+	// referral (click-to-WhatsApp ad or post) decides the channel. Skipped once
+	// a real channel is recorded — the update is write-once.
+	if !channel.Valid || channel.String == "organic" {
+		if err := orchCaptureAcquisitionChannel(ctx, pool, oc.customerID, recipientPhone, senderPhone); err != nil {
+			return oc, false, err
+		}
 	}
 	// Nested profile create only runs on first contact (:353).
 	if _, err := pool.Exec(ctx,
@@ -275,6 +311,18 @@ func orchResolveConversationContext(ctx context.Context, pool *pgxpool.Pool, rec
 		 ON CONFLICT (customer_id) DO NOTHING`,
 		uuid.NewString(), oc.customerID); err != nil {
 		return oc, false, fmt.Errorf("orchestrator: ensure customer profile: %w", err)
+	}
+	// Personalisation read (Node's include:{profile:true} on the same
+	// upsert): totalOrders gates the order-history lines, deliveryArea feeds
+	// the "known delivery area" suggestion.
+	var deliveryArea pgtype.Text
+	if err := pool.QueryRow(ctx,
+		`SELECT total_orders, delivery_area FROM customer_profiles WHERE customer_id = $1`,
+		oc.customerID).Scan(&oc.profileTotalOrders, &deliveryArea); err != nil {
+		return oc, false, fmt.Errorf("orchestrator: read customer profile: %w", err)
+	}
+	if deliveryArea.Valid {
+		oc.profileDeliveryArea = deliveryArea.String
 	}
 
 	// Conversation upsert keyed [businessId,customerPhone] (:359-374).
@@ -299,6 +347,29 @@ func orchResolveConversationContext(ctx context.Context, pool *pgxpool.Pool, rec
 		return oc, false, fmt.Errorf("orchestrator: backfill inbound links: %w", err)
 	}
 	return oc, true, nil
+}
+
+// orchCaptureAcquisitionChannel finds the earliest referral-bearing inbound
+// message from this sender to this business number and records the channel.
+func orchCaptureAcquisitionChannel(ctx context.Context, pool *pgxpool.Pool, customerID, recipientPhone, senderPhone string) error {
+	var raw []byte
+	err := pool.QueryRow(ctx,
+		`SELECT raw_payload->'referral' FROM inbound_messages
+		  WHERE recipient_phone = $1 AND sender_phone = $2
+		    AND jsonb_typeof(raw_payload->'referral') = 'object'
+		  ORDER BY "timestamp" ASC LIMIT 1`, recipientPhone, senderPhone).Scan(&raw)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("orchestrator: referral lookup: %w", err)
+	}
+	var referral map[string]any
+	if err := json.Unmarshal(raw, &referral); err != nil {
+		return nil // malformed referral: nothing to attribute
+	}
+	_, err = crmUpdateAcquisitionChannel(ctx, pool, customerID, AcquisitionChannelFromReferral(referral))
+	return err
 }
 
 type orchLatest struct {
@@ -379,6 +450,18 @@ func orchProcessMediaPayload(ctx context.Context, deps OrchestratorDeps, convers
 	if dlErr != nil { // :427-440
 		slog.Error("Failed to process media", "conversationId", conversationID, "err", dlErr)
 		return escalateBranch(orchMediaFailReason, orchMediaFailMsg)
+	}
+	if mediaType == "audio" && latest.whatsappID != "" {
+		// The LLM's message history is rebuilt from inbound_messages, where a
+		// voice note has no text — so without this the model never sees what
+		// the customer said (the transcript only reached catalog retrieval and
+		// the safety check). Persisting it also shows the words in the inbox.
+		if _, err := deps.Pool.Exec(ctx,
+			`UPDATE inbound_messages SET text_content = $2
+			 WHERE whatsapp_message_id = $1 AND text_content IS NULL`,
+			latest.whatsappID, textContent); err != nil {
+			return "", "", false, fmt.Errorf("orchestrator: persist voice note transcript: %w", err)
+		}
 	}
 	return textContent, imageURL, false, nil
 }
@@ -503,13 +586,25 @@ func orchGenerateAndHandleLlmResponse(ctx context.Context, deps OrchestratorDeps
 	}
 	shownImagesCtx := orchBuildShownImagesContext(alreadyShown)
 
+	// Only worth the extra query for a customer who has actually ordered
+	// before — a brand-new lead has no history to personalise with.
+	favoriteProduct := ""
+	if oc.profileTotalOrders > 0 {
+		favoriteProduct, err = orchFavoriteProduct(ctx, deps.Pool, oc.customerID)
+		if err != nil {
+			return err
+		}
+	}
+	customerContextCtx := orchBuildCustomerContext(oc, favoriteProduct)
+
 	paymentMethods := orchCurrencyFor(oc.currency).PaymentMethods
 	req := orchestrator.GenerateRequest{
-		System: strings.Join([]string{
-			"Current Conversation State: " + string(oc.state),
-			"Accepted payment methods: " + paymentMethods,
-			catalogContext + shownImagesCtx,
-		}, "\n\n"),
+		System: orchestrator.SystemPrompt(orchestrator.PromptParams{
+			ConversationState: string(oc.state),
+			PaymentMethods:    paymentMethods,
+			CatalogBlock:      catalogContext,
+			ShownBlock:        shownImagesCtx + customerContextCtx,
+		}),
 		Messages: history,
 	}
 	if imageURL != "" {

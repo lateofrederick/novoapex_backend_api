@@ -9,8 +9,11 @@ type CrmSignals struct {
 	OrderConfirmed      bool           `json:"order_confirmed"`
 	DetectedItems       []DetectedItem `json:"detected_items"`
 	DeliveryArea        *string        `json:"delivery_area"`
+	FulfillmentChoice   *string        `json:"fulfillment_choice"` // "delivery" | "pickup" | nil
+	PickupLocationID    *string        `json:"pickup_location_id"`
 	CustomerName        *string        `json:"customer_name"`
 	DetectedPreferences []string       `json:"detected_preferences"`
+	WantsUpdates        *bool          `json:"wants_updates"`
 	Sentiment           string         `json:"sentiment"`
 }
 

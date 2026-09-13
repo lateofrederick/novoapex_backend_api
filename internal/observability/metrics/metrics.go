@@ -1,3 +1,9 @@
+// Package metrics serves the Prometheus exposition endpoint (/metrics), the
+// port of MetricsModule (@willsoto/nestjs-prometheus with defaultMetrics
+// enabled). prom-client's default metrics are the Node runtime + process
+// families; the Go equivalents are the Go runtime collector (go_goroutines,
+// go_memstats_*, go_gc_duration_seconds, …) and the process collector
+// (process_cpu_seconds_total, process_resident_memory_bytes, …).
 package metrics
 
 import (
@@ -9,61 +15,25 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
-var NodeDefaultMetricFamilies = []string{
-	"nodejs_active_handles",
-	"nodejs_active_handles_total",
-	"nodejs_active_requests",
-	"nodejs_active_requests_total",
-	"nodejs_active_resources",
-	"nodejs_active_resources_total",
-	"nodejs_eventloop_lag_max_seconds",
-	"nodejs_eventloop_lag_mean_seconds",
-	"nodejs_eventloop_lag_min_seconds",
-	"nodejs_eventloop_lag_p50_seconds",
-	"nodejs_eventloop_lag_p90_seconds",
-	"nodejs_eventloop_lag_p99_seconds",
-	"nodejs_eventloop_lag_seconds",
-	"nodejs_eventloop_lag_stddev_seconds",
-	"nodejs_external_memory_bytes",
-	"nodejs_gc_duration_seconds",
-	"nodejs_heap_size_total_bytes",
-	"nodejs_heap_size_used_bytes",
-	"nodejs_heap_space_size_available_bytes",
-	"nodejs_heap_space_size_total_bytes",
-	"nodejs_heap_space_size_used_bytes",
-	"nodejs_version_info",
-	"process_cpu_seconds_total",
-	"process_cpu_system_seconds_total",
-	"process_cpu_user_seconds_total",
-	"process_resident_memory_bytes",
-	"process_start_time_seconds",
-}
+// Registry holds every metric the process exposes. Application metrics
+// register here too.
+var Registry = newRegistry()
 
-var PortedCustomAppMetrics = []string{}
-
-var KnownGaps = []string{
-	"grafana_dashboard_http_request_duration_seconds_served_by_neither_node_nor_go",
-	"grafana_loki_label_service_equals_novoapex_api_but_promtail_assigns_compose_service_key_api",
-	"go_collector_families_go_goroutines_go_memstats_not_served_by_node_so_not_registered_here",
-	"nodejs_runtime_and_heap_and_eventloop_families_have_no_go_equivalent_in_this_registry",
-	"nodejs_gc_duration_seconds_histogram_has_no_same_name_go_counterpart",
-	"process_cpu_user_system_split_not_exposed_by_go_process_collector",
-	"process_heap_bytes_served_by_node_linux_only_not_exposed_by_go_client",
-	"promtail_timestamp_stage_parses_rfc3339nano_but_pino_time_field_is_epoch_milliseconds",
-}
-
-var Registry = newParityRegistry()
-
-func newParityRegistry() *prometheus.Registry {
+func newRegistry() *prometheus.Registry {
 	reg := prometheus.NewRegistry()
-	reg.MustRegister(collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}))
+	reg.MustRegister(
+		collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}),
+		collectors.NewGoCollector(),
+	)
 	return reg
 }
 
+// Handler serves the registry in the Prometheus text format.
 func Handler() http.Handler {
 	return promhttp.HandlerFor(Registry, promhttp.HandlerOpts{})
 }
 
+// FamilyNames lists the metric families currently exposed, sorted.
 func FamilyNames() ([]string, error) {
 	mfs, err := Registry.Gather()
 	if err != nil {
