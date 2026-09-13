@@ -6,17 +6,26 @@
 
 -- Orders -------------------------------------------------------------------
 
--- orders.service findAll: include customer:true, orderBy createdAt desc.
+-- orders.service findAll: include customer:true, location:true (delivery-vs-
+-- pickup port, this session's Node work), orderBy createdAt desc.
 -- name: ListOrdersWithCustomer :many
 SELECT o.id, o.business_id, o.customer_id, o.conversation_id, o.idempotency_key,
-       o.status, o.total_amount, o.currency, o.created_at, o.updated_at,
+       o.status, o.total_amount, o.currency, o.fulfillment_type, o.location_id,
+       o.created_at, o.updated_at,
        c.id AS c_id, c.business_id AS c_business_id, c.phone AS c_phone, c.name AS c_name,
        c.acquisition_channel AS c_acquisition_channel,
+       c.marketing_opt_in AS c_marketing_opt_in,
        c.first_contact_at AS c_first_contact_at,
        c.last_contact_at AS c_last_contact_at,
-       c.created_at AS c_created_at, c.updated_at AS c_updated_at
+       c.created_at AS c_created_at, c.updated_at AS c_updated_at,
+       l.id AS l_id, l.business_id AS l_business_id, l.name AS l_name, l.address AS l_address,
+       l.shop_number AS l_shop_number, l.landmark AS l_landmark, l.opening_time AS l_opening_time,
+       l.closing_time AS l_closing_time, l.offers_delivery AS l_offers_delivery,
+       l.offers_pickup AS l_offers_pickup, l.is_active AS l_is_active,
+       l.created_at AS l_created_at, l.updated_at AS l_updated_at
 FROM orders o
 LEFT JOIN customers c ON c.id = o.customer_id
+LEFT JOIN business_locations l ON l.id = o.location_id
 WHERE o.business_id = $1
 ORDER BY o.created_at DESC
 LIMIT $2 OFFSET $3;
@@ -31,12 +40,20 @@ SELECT COUNT(*)::bigint AS total FROM orders WHERE business_id = $1 AND status =
 -- name: SumOrderTotalsWherePaid :one
 SELECT COALESCE(SUM(total_amount), 0)::numeric AS total_revenue FROM orders WHERE business_id = $1 AND status = 'PAID';
 
--- findOne: include customer + items.product. The order row is already
--- business-scoped; its items join out from that verified order id.
+-- findOne: include customer + items.product + location. The order row is
+-- already business-scoped; its items join out from that verified order id.
 -- name: GetOrderByIDAndBusiness :one
-SELECT id, business_id, customer_id, conversation_id, idempotency_key, status, total_amount, currency, created_at, updated_at
+SELECT id, business_id, customer_id, conversation_id, idempotency_key, status, total_amount, currency, fulfillment_type, location_id, created_at, updated_at
 FROM orders
 WHERE id = $1 AND business_id = $2;
+
+-- location for GetOrderByIDAndBusiness's response (mirrors the ordinary
+-- locations findOne query — orders_write.go's own lookups stay narrower).
+-- name: GetLocationByID :one
+SELECT id, business_id, name, address, shop_number, landmark, opening_time,
+       closing_time, offers_delivery, offers_pickup, is_active, created_at, updated_at
+FROM business_locations
+WHERE id = $1;
 
 -- name: ListOrderItemsWithProduct :many
 SELECT oi.id, oi.order_id, oi.product_id, oi.product_name, oi.quantity, oi.unit_price,
@@ -67,6 +84,7 @@ SELECT v.id, v.business_id, v.customer_id, v.customer_phone, v.state,
        v.is_escalated_to_human, v.language, v.escalation_reason, v.created_at, v.updated_at,
        c.id AS c_id, c.business_id AS c_business_id, c.phone AS c_phone, c.name AS c_name,
        c.acquisition_channel AS c_acquisition_channel,
+       c.marketing_opt_in AS c_marketing_opt_in,
        c.first_contact_at AS c_first_contact_at,
        c.last_contact_at AS c_last_contact_at,
        c.created_at AS c_created_at, c.updated_at AS c_updated_at

@@ -32,11 +32,26 @@ WHERE id = $1;
 -- order.create (order-ledger.handler.ts:144-154): status CONFIRMED,
 -- idempotencyKey = sourceMessageId (unique index orders_idempotency_key_key is
 -- the duplicate-job backstop), tenant currency stamped on the row.
+-- fulfillment_type/location_id added for the delivery-vs-pickup port
+-- (order-ledger.handler.ts resolveFulfillment): location_id nil for DELIVERY
+-- or an unresolved PICKUP short id (never blocks order creation).
 -- name: InsertOrder :one
 INSERT INTO orders
-    (id, business_id, customer_id, conversation_id, idempotency_key, status, total_amount, currency, updated_at)
-VALUES ($1, $2, $3, $4, $5, 'CONFIRMED', $6, $7, CURRENT_TIMESTAMP)
+    (id, business_id, customer_id, conversation_id, idempotency_key, status, total_amount, currency, fulfillment_type, location_id, updated_at)
+VALUES ($1, $2, $3, $4, $5, 'CONFIRMED', $6, $7, $8, $9, CURRENT_TIMESTAMP)
 RETURNING id;
+
+-- resolveFulfillment's pickup-location lookup (order-ledger.handler.ts
+-- resolvePickupLocation): short-ID prefix match, scoped to the business, and
+-- gated on offers_pickup + is_active exactly like the Node port. Callers must
+-- already have validated the short ID against ^[0-9a-f]{8}$.
+-- name: ResolvePickupLocationByShortID :one
+SELECT id FROM business_locations
+WHERE business_id = $1
+  AND offers_pickup = true
+  AND is_active = true
+  AND id LIKE $2
+LIMIT 1;
 
 -- orderItem.createMany (order-ledger.handler.ts:157-165): one ledger row per
 -- detected entry — duplicates for the same product are kept verbatim (each
@@ -129,3 +144,27 @@ WHERE id = $2;
 INSERT INTO scheduled_follow_ups (id, order_id, business_id, customer_id, job_type, scheduled_at)
 VALUES ($1, $2, $3, $4, $5, $6),
        ($7, $8, $9, $10, $11, $12);
+
+-- Singular follow-up scheduling, additive to the pair above: the +48h
+-- unpaid-invoice-second reminder (order-ledger.handler.ts) and the
+-- delivery-confirmation reminder scheduled from orders_write.go on the
+-- DELIVERED transition. Kept as its own query rather than widening the pair
+-- above so the already-tested 2-row statement is untouched.
+-- name: InsertScheduledFollowUp :exec
+INSERT INTO scheduled_follow_ups (id, order_id, business_id, customer_id, job_type, scheduled_at)
+VALUES ($1, $2, $3, $4, $5, $6);
+
+-- Payment-behaviour tracking (followup.go / payment_events.go) -----------------
+--
+-- Both files are raw-SQL throughout (no sqlc usage) — the late-payment-count
+-- increment and preferred-payment-network write live inline there as plain
+-- pool.Exec calls, matching each file's own established convention, rather
+-- than as sqlc queries here.
+
+-- Marketing opt-in ------------------------------------------------------------
+
+-- customer-capture.handler.ts updateMarketingOptIn: records explicit
+-- consent/decline from the wants_updates CRM signal.
+-- name: UpdateCustomerMarketingOptIn :execrows
+UPDATE customers SET marketing_opt_in = $1, updated_at = CURRENT_TIMESTAMP
+WHERE id = $2;

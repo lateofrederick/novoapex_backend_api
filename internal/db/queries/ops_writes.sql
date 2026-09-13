@@ -46,15 +46,8 @@ FROM conversations c
 JOIN businesses b ON b.id = c.business_id
 WHERE c.id = $1 AND c.business_id = $2;
 
--- WhatsApp 24h window gate (conversation-orchestrator.service.ts:34-41):
--- newest inbound_messages.timestamp for the conversation decides. MAX() over
--- an empty set yields NULL (Valid=false) which maps to "no inbound => closed".
--- name: GetLatestInboundTimestamp :one
-SELECT MAX(timestamp)::timestamp AS latest FROM inbound_messages WHERE conversation_id = $1;
-
--- Persist the outbound row BEFORE enqueueing (orchestrator lines 45-74):
--- blocked sends get raw_payload '{}' and status 'failed_24h_window_closed';
--- allowed sends get the WhatsApp text payload shape and status 'pending'.
+-- Persist an outbound row BEFORE it is delivered, so it takes its place in
+-- the conversation's send order (outbound_messages.seq).
 -- name: InsertOutboundMessage :one
 INSERT INTO outbound_messages
     (id, recipient_phone, message_type, text_content, raw_payload, meta_response,

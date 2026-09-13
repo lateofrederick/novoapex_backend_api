@@ -5,7 +5,7 @@
 -- entirely — Node responses carry no embedding key and neither must ours.
 
 -- name: ListCustomersByBusiness :many
-SELECT id, business_id, phone, name, acquisition_channel, first_contact_at, last_contact_at, created_at, updated_at
+SELECT id, business_id, phone, name, acquisition_channel, first_contact_at, last_contact_at, created_at, updated_at, marketing_opt_in
 FROM customers
 WHERE business_id = $1
 ORDER BY last_contact_at DESC
@@ -19,12 +19,12 @@ SELECT COUNT(*)::bigint AS total FROM customers
 WHERE business_id = $1 AND created_at >= $2;
 
 -- name: GetCustomerByIDAndBusiness :one
-SELECT id, business_id, phone, name, acquisition_channel, first_contact_at, last_contact_at, created_at, updated_at
+SELECT id, business_id, phone, name, acquisition_channel, first_contact_at, last_contact_at, created_at, updated_at, marketing_opt_in
 FROM customers
 WHERE id = $1 AND business_id = $2;
 
 -- name: GetCustomerProfileByCustomerID :one
-SELECT id, customer_id, preferences, delivery_area, average_order_value, order_frequency_days, last_order_at, last_reengagement_at, total_orders, total_spent, sentiment, updated_at
+SELECT id, customer_id, preferences, delivery_area, average_order_value, order_frequency_days, last_order_at, total_orders, total_spent, sentiment, updated_at, last_reengagement_at, late_payment_count, preferred_payment_network
 FROM customer_profiles
 WHERE customer_id = $1;
 
