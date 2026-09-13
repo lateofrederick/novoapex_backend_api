@@ -31,7 +31,7 @@ import (
 	"github.com/novoapex/novoapex-backend-api/internal/storage"
 )
 
-const s4pJWTSecret = "0123456789abcdef0123456789abcdef" // == harness Node stack JWT_SECRET
+const s4pJWTSecret = "0123456789abcdef0123456789abcdef"
 
 type s4pEnv struct {
 	T    *testing.T
@@ -51,12 +51,8 @@ func s4p_start(t *testing.T) *s4pEnv {
 	}
 	t.Cleanup(func() { h.Terminate(context.Background()) })
 
-	repoDir, err := harness.NovoApexRepoDir()
-	if err != nil {
-		t.Skipf("novoapex repo not reachable: %v", err)
-	}
-	if err := harness.ApplyPrismaMigrations(ctx, repoDir, h.PostgresDSN); err != nil {
-		t.Fatalf("apply migrations: %v", err)
+	if err := harness.ApplyBaselineSchema(ctx, h.PostgresDSN); err != nil {
+		t.Fatalf("apply schema: %v", err)
 	}
 
 	db, err := sql.Open("pgx", h.PostgresDSN)

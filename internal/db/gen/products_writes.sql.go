@@ -35,7 +35,7 @@ const createBusiness = `-- name: CreateBusiness :one
 
 INSERT INTO businesses (id, name, whatsapp_phone_number_id, owner_phone, currency, category, location, updated_at)
 VALUES ($1, $2, $3, $4, $5, $6, $7, CURRENT_TIMESTAMP)
-RETURNING id, name, whatsapp_phone_number_id, created_at, updated_at, currency, assistant_enabled, category, confirmation_delay_hours, location, owner_phone, paystack_recipient_code, payment_callback_url, template_language
+RETURNING id, name, whatsapp_phone_number_id, created_at, updated_at, currency, assistant_enabled, category, confirmation_delay_hours, location, owner_phone, paystack_recipient_code, payment_callback_url, template_language, new_arrivals_template_name, last_new_arrivals_notified_at
 `
 
 type CreateBusinessParams struct {
@@ -83,6 +83,8 @@ func (q *Queries) CreateBusiness(ctx context.Context, arg CreateBusinessParams) 
 		&i.PaystackRecipientCode,
 		&i.PaymentCallbackUrl,
 		&i.TemplateLanguage,
+		&i.NewArrivalsTemplateName,
+		&i.LastNewArrivalsNotifiedAt,
 	)
 	return i, err
 }

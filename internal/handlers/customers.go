@@ -36,6 +36,7 @@ type customerJSON struct {
 	Phone              string  `json:"phone"`
 	Name               *string `json:"name"`
 	AcquisitionChannel *string `json:"acquisitionChannel"`
+	MarketingOptIn     bool    `json:"marketingOptIn"`
 	FirstContactAt     isoTime `json:"firstContactAt"`
 	LastContactAt      isoTime `json:"lastContactAt"`
 	CreatedAt          isoTime `json:"createdAt"`
@@ -49,6 +50,7 @@ func ep_customer(row gen.Customer) customerJSON {
 		Phone:              row.Phone,
 		Name:               ep_text(row.Name),
 		AcquisitionChannel: ep_text(row.AcquisitionChannel),
+		MarketingOptIn:     row.MarketingOptIn,
 		FirstContactAt:     epISO(row.FirstContactAt.Time),
 		LastContactAt:      epISO(row.LastContactAt.Time),
 		CreatedAt:          epISO(row.CreatedAt.Time),
@@ -58,18 +60,20 @@ func ep_customer(row gen.Customer) customerJSON {
 
 // profileJSON mirrors the Prisma CustomerProfile payload.
 type profileJSON struct {
-	ID                 string          `json:"id"`
-	CustomerID         string          `json:"customerId"`
-	Preferences        json.RawMessage `json:"preferences"`
-	DeliveryArea       *string         `json:"deliveryArea"`
-	AverageOrderValue  *money.Number   `json:"averageOrderValue"`
-	OrderFrequencyDays *float64        `json:"orderFrequencyDays"`
-	LastOrderAt        *isoTime        `json:"lastOrderAt"`
-	LastReengagementAt *isoTime        `json:"lastReengagementAt"`
-	TotalOrders        int32           `json:"totalOrders"`
-	TotalSpent         money.Number    `json:"totalSpent"`
-	Sentiment          *string         `json:"sentiment"`
-	UpdatedAt          isoTime         `json:"updatedAt"`
+	ID                      string          `json:"id"`
+	CustomerID              string          `json:"customerId"`
+	Preferences             json.RawMessage `json:"preferences"`
+	DeliveryArea            *string         `json:"deliveryArea"`
+	AverageOrderValue       *money.Number   `json:"averageOrderValue"`
+	OrderFrequencyDays      *float64        `json:"orderFrequencyDays"`
+	LastOrderAt             *isoTime        `json:"lastOrderAt"`
+	LastReengagementAt      *isoTime        `json:"lastReengagementAt"`
+	TotalOrders             int32           `json:"totalOrders"`
+	TotalSpent              money.Number    `json:"totalSpent"`
+	Sentiment               *string         `json:"sentiment"`
+	LatePaymentCount        int32           `json:"latePaymentCount"`
+	PreferredPaymentNetwork *string         `json:"preferredPaymentNetwork"`
+	UpdatedAt               isoTime         `json:"updatedAt"`
 }
 
 // customersList ports CustomersService.findAll (customers.service.ts:10-33):
@@ -180,18 +184,20 @@ func customersGet(pool *pgxpool.Pool) http.HandlerFunc {
 			return
 		default:
 			profile = profileJSON{
-				ID:                 prow.ID,
-				CustomerID:         prow.CustomerID,
-				Preferences:        json.RawMessage(prow.Preferences),
-				DeliveryArea:       ep_text(prow.DeliveryArea),
-				AverageOrderValue:  ep_numeric(prow.AverageOrderValue),
-				OrderFrequencyDays: ep_float8(prow.OrderFrequencyDays),
-				LastOrderAt:        epISOPtr(prow.LastOrderAt),
-				LastReengagementAt: epISOPtr(prow.LastReengagementAt),
-				TotalOrders:        prow.TotalOrders,
-				TotalSpent:         ep_num(prow.TotalSpent),
-				Sentiment:          ep_text(prow.Sentiment),
-				UpdatedAt:          epISO(prow.UpdatedAt.Time),
+				ID:                      prow.ID,
+				CustomerID:              prow.CustomerID,
+				Preferences:             json.RawMessage(prow.Preferences),
+				DeliveryArea:            ep_text(prow.DeliveryArea),
+				AverageOrderValue:       ep_numeric(prow.AverageOrderValue),
+				OrderFrequencyDays:      ep_float8(prow.OrderFrequencyDays),
+				LastOrderAt:             epISOPtr(prow.LastOrderAt),
+				LastReengagementAt:      epISOPtr(prow.LastReengagementAt),
+				TotalOrders:             prow.TotalOrders,
+				TotalSpent:              ep_num(prow.TotalSpent),
+				Sentiment:               ep_text(prow.Sentiment),
+				LatePaymentCount:        prow.LatePaymentCount,
+				PreferredPaymentNetwork: ep_text(prow.PreferredPaymentNetwork),
+				UpdatedAt:               epISO(prow.UpdatedAt.Time),
 			}
 		}
 

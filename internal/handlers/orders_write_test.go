@@ -104,7 +104,11 @@ func TestS4O_T4_16_Fulfillment(t *testing.T) {
 	})
 
 	t.Run("every UpdateOrderDto enum value is accepted", func(t *testing.T) {
-		for _, s := range []string{"PENDING", "CONFIRMED", "PAYMENT_PENDING", "PAID"} {
+		// Originally PENDING/CONFIRMED/PAYMENT_PENDING/PAID only — DELIVERED
+		// (and PROCESSING/SHIPPED/CANCELLED) could never be set through this
+		// endpoint at all, which silently blocked the delivery-confirmation
+		// follow-up. Expanded to the full OrderStatus enum to fix that.
+		for _, s := range []string{"PENDING", "CONFIRMED", "PAYMENT_PENDING", "PAID", "PROCESSING", "SHIPPED", "DELIVERED", "CANCELLED"} {
 			rec := s4o_do(t, h, http.MethodPatch, "/orders/"+orderID+"/fulfillment",
 				fmt.Sprintf(`{"status":%q}`, s), &claims)
 			if rec.Code != http.StatusOK {
@@ -114,16 +118,61 @@ func TestS4O_T4_16_Fulfillment(t *testing.T) {
 	})
 
 	t.Run("status outside DTO set -> zod invalid_enum_value 400", func(t *testing.T) {
+		// Self-contained: reset to a known status rather than relying on
+		// whatever the previous subtest's enum sweep left behind.
+		if _, err := e.DB.Exec(`UPDATE orders SET status = 'PAID' WHERE id = $1`, orderID); err != nil {
+			t.Fatalf("reset status: %v", err)
+		}
+
 		rec := s4o_do(t, h, http.MethodPatch, "/orders/"+orderID+"/fulfillment",
-			`{"status":"SHIPPED"}`, &claims)
+			`{"status":"REFUNDED"}`, &claims)
 		s4o_assertZodIssue(t, rec, "invalid_enum_value", "status")
 		if !strings.Contains(rec.Body.String(), "Invalid enum value") ||
-			!strings.Contains(rec.Body.String(), "'PAYMENT_PENDING'") {
+			!strings.Contains(rec.Body.String(), "'DELIVERED'") {
 			t.Errorf("message shape mismatch: %s", rec.Body.String())
 		}
 		var dbStatus string
 		if err := e.DB.QueryRow(`SELECT status::text FROM orders WHERE id = $1`, orderID).Scan(&dbStatus); err != nil || dbStatus != "PAID" {
 			t.Errorf("rejected write must not persist; db=%q err=%v", dbStatus, err)
+		}
+	})
+
+	t.Run("DELIVERED transition schedules a delivery-confirmation follow-up", func(t *testing.T) {
+		// Fresh order: the shared orderID above may already have passed
+		// through DELIVERED during the full-enum-set sweep, which would make
+		// "first DELIVERED transition" assertions here ambiguous.
+		freshID := "s4o-ord-delivered"
+		ep_seedOrder(t, e, freshID, biz.ID, cust.ID, "", "SHIPPED", "40.00", now)
+
+		rec := s4o_do(t, h, http.MethodPatch, "/orders/"+freshID+"/fulfillment",
+			`{"status":"DELIVERED"}`, &claims)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+		}
+		var n int
+		if err := e.DB.QueryRow(
+			`SELECT COUNT(*) FROM scheduled_follow_ups WHERE order_id = $1 AND job_type = 'delivery-confirmation'`,
+			freshID).Scan(&n); err != nil {
+			t.Fatalf("count scheduled follow-ups: %v", err)
+		}
+		if n != 1 {
+			t.Errorf("delivery-confirmation follow-ups = %d, want 1", n)
+		}
+
+		// A second DELIVERED update (already DELIVERED) must not schedule a
+		// duplicate follow-up.
+		rec2 := s4o_do(t, h, http.MethodPatch, "/orders/"+freshID+"/fulfillment",
+			`{"status":"DELIVERED"}`, &claims)
+		if rec2.Code != http.StatusOK {
+			t.Fatalf("status=%d body=%s", rec2.Code, rec2.Body.String())
+		}
+		if err := e.DB.QueryRow(
+			`SELECT COUNT(*) FROM scheduled_follow_ups WHERE order_id = $1 AND job_type = 'delivery-confirmation'`,
+			freshID).Scan(&n); err != nil {
+			t.Fatalf("count scheduled follow-ups (2nd): %v", err)
+		}
+		if n != 1 {
+			t.Errorf("delivery-confirmation follow-ups after repeat DELIVERED = %d, want still 1", n)
 		}
 	})
 

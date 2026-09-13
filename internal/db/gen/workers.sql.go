@@ -128,24 +128,29 @@ func (q *Queries) GetCustomerNameByID(ctx context.Context, id string) (pgtype.Te
 
 const insertOrder = `-- name: InsertOrder :one
 INSERT INTO orders
-    (id, business_id, customer_id, conversation_id, idempotency_key, status, total_amount, currency, updated_at)
-VALUES ($1, $2, $3, $4, $5, 'CONFIRMED', $6, $7, CURRENT_TIMESTAMP)
+    (id, business_id, customer_id, conversation_id, idempotency_key, status, total_amount, currency, fulfillment_type, location_id, updated_at)
+VALUES ($1, $2, $3, $4, $5, 'CONFIRMED', $6, $7, $8, $9, CURRENT_TIMESTAMP)
 RETURNING id
 `
 
 type InsertOrderParams struct {
-	ID             string          `json:"id"`
-	BusinessID     string          `json:"business_id"`
-	CustomerID     string          `json:"customer_id"`
-	ConversationID pgtype.Text     `json:"conversation_id"`
-	IdempotencyKey pgtype.Text     `json:"idempotency_key"`
-	TotalAmount    decimal.Decimal `json:"total_amount"`
-	Currency       string          `json:"currency"`
+	ID              string          `json:"id"`
+	BusinessID      string          `json:"business_id"`
+	CustomerID      string          `json:"customer_id"`
+	ConversationID  pgtype.Text     `json:"conversation_id"`
+	IdempotencyKey  pgtype.Text     `json:"idempotency_key"`
+	TotalAmount     decimal.Decimal `json:"total_amount"`
+	Currency        string          `json:"currency"`
+	FulfillmentType FulfillmentType `json:"fulfillment_type"`
+	LocationID      pgtype.Text     `json:"location_id"`
 }
 
 // order.create (order-ledger.handler.ts:144-154): status CONFIRMED,
 // idempotencyKey = sourceMessageId (unique index orders_idempotency_key_key is
 // the duplicate-job backstop), tenant currency stamped on the row.
+// fulfillment_type/location_id added for the delivery-vs-pickup port
+// (order-ledger.handler.ts resolveFulfillment): location_id nil for DELIVERY
+// or an unresolved PICKUP short id (never blocks order creation).
 func (q *Queries) InsertOrder(ctx context.Context, arg InsertOrderParams) (string, error) {
 	row := q.db.QueryRow(ctx, insertOrder,
 		arg.ID,
@@ -155,6 +160,8 @@ func (q *Queries) InsertOrder(ctx context.Context, arg InsertOrderParams) (strin
 		arg.IdempotencyKey,
 		arg.TotalAmount,
 		arg.Currency,
+		arg.FulfillmentType,
+		arg.LocationID,
 	)
 	var id string
 	err := row.Scan(&id)
@@ -174,6 +181,37 @@ FROM jsonb_to_recordset($1::jsonb)
 // are cast SQL-side; they never pass through float64 JSON numbers.
 func (q *Queries) InsertOrderItems(ctx context.Context, items []byte) error {
 	_, err := q.db.Exec(ctx, insertOrderItems, items)
+	return err
+}
+
+const insertScheduledFollowUp = `-- name: InsertScheduledFollowUp :exec
+INSERT INTO scheduled_follow_ups (id, order_id, business_id, customer_id, job_type, scheduled_at)
+VALUES ($1, $2, $3, $4, $5, $6)
+`
+
+type InsertScheduledFollowUpParams struct {
+	ID          string           `json:"id"`
+	OrderID     string           `json:"order_id"`
+	BusinessID  string           `json:"business_id"`
+	CustomerID  string           `json:"customer_id"`
+	JobType     string           `json:"job_type"`
+	ScheduledAt pgtype.Timestamp `json:"scheduled_at"`
+}
+
+// Singular follow-up scheduling, additive to the pair above: the +48h
+// unpaid-invoice-second reminder (order-ledger.handler.ts) and the
+// delivery-confirmation reminder scheduled from orders_write.go on the
+// DELIVERED transition. Kept as its own query rather than widening the pair
+// above so the already-tested 2-row statement is untouched.
+func (q *Queries) InsertScheduledFollowUp(ctx context.Context, arg InsertScheduledFollowUpParams) error {
+	_, err := q.db.Exec(ctx, insertScheduledFollowUp,
+		arg.ID,
+		arg.OrderID,
+		arg.BusinessID,
+		arg.CustomerID,
+		arg.JobType,
+		arg.ScheduledAt,
+	)
 	return err
 }
 
@@ -219,6 +257,31 @@ func (q *Queries) InsertScheduledFollowUpPair(ctx context.Context, arg InsertSch
 		arg.ScheduledAt_2,
 	)
 	return err
+}
+
+const resolvePickupLocationByShortID = `-- name: ResolvePickupLocationByShortID :one
+SELECT id FROM business_locations
+WHERE business_id = $1
+  AND offers_pickup = true
+  AND is_active = true
+  AND id LIKE $2
+LIMIT 1
+`
+
+type ResolvePickupLocationByShortIDParams struct {
+	BusinessID string `json:"business_id"`
+	ID         string `json:"id"`
+}
+
+// resolveFulfillment's pickup-location lookup (order-ledger.handler.ts
+// resolvePickupLocation): short-ID prefix match, scoped to the business, and
+// gated on offers_pickup + is_active exactly like the Node port. Callers must
+// already have validated the short ID against ^[0-9a-f]{8}$.
+func (q *Queries) ResolvePickupLocationByShortID(ctx context.Context, arg ResolvePickupLocationByShortIDParams) (string, error) {
+	row := q.db.QueryRow(ctx, resolvePickupLocationByShortID, arg.BusinessID, arg.ID)
+	var id string
+	err := row.Scan(&id)
+	return id, err
 }
 
 const resolveProductByShortID = `-- name: ResolveProductByShortID :one
@@ -267,6 +330,35 @@ func (q *Queries) ResolveProductByShortID(ctx context.Context, arg ResolveProduc
 		&i.Stock,
 	)
 	return i, err
+}
+
+const updateCustomerMarketingOptIn = `-- name: UpdateCustomerMarketingOptIn :execrows
+
+
+UPDATE customers SET marketing_opt_in = $1, updated_at = CURRENT_TIMESTAMP
+WHERE id = $2
+`
+
+type UpdateCustomerMarketingOptInParams struct {
+	MarketingOptIn bool   `json:"marketing_opt_in"`
+	ID             string `json:"id"`
+}
+
+// Payment-behaviour tracking (followup.go / payment_events.go) -----------------
+//
+// Both files are raw-SQL throughout (no sqlc usage) — the late-payment-count
+// increment and preferred-payment-network write live inline there as plain
+// pool.Exec calls, matching each file's own established convention, rather
+// than as sqlc queries here.
+// Marketing opt-in ------------------------------------------------------------
+// customer-capture.handler.ts updateMarketingOptIn: records explicit
+// consent/decline from the wants_updates CRM signal.
+func (q *Queries) UpdateCustomerMarketingOptIn(ctx context.Context, arg UpdateCustomerMarketingOptInParams) (int64, error) {
+	result, err := q.db.Exec(ctx, updateCustomerMarketingOptIn, arg.MarketingOptIn, arg.ID)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
 }
 
 const updateCustomerName = `-- name: UpdateCustomerName :execrows

@@ -17,6 +17,7 @@ var s4pBusinessKeys = []string{
 	"id", "name", "whatsappPhoneNumberId", "createdAt", "updatedAt", "currency",
 	"assistantEnabled", "category", "confirmationDelayHours", "location",
 	"ownerPhone", "paystackRecipientCode", "paymentCallbackUrl", "templateLanguage",
+	"newArrivalsTemplateName", "lastNewArrivalsNotifiedAt",
 }
 
 func TestS4pBusinessesCreateConflictAndZod(t *testing.T) {

@@ -66,6 +66,7 @@ type Config struct {
 
 	ReengagementThresholdMultiplier float64
 	ReengagementCooldownDays        int
+	NewArrivalsIntervalDays         int
 }
 
 type envFunc func(string) (string, bool)
@@ -195,6 +196,14 @@ func load(lookup envFunc) (*Config, error) {
 		func(v float64) string {
 			if v < 0 || v != math.Trunc(v) {
 				return "must be a nonnegative integer"
+			}
+			return ""
+		}, fail)
+
+	c.NewArrivalsIntervalDays = intFrom(lookup, "NEW_ARRIVALS_INTERVAL_DAYS", 14,
+		func(v float64) string {
+			if v <= 0 || v != math.Trunc(v) {
+				return "must be a positive integer"
 			}
 			return ""
 		}, fail)

@@ -59,6 +59,48 @@ func (ns NullConversationState) Value() (driver.Value, error) {
 	return string(ns.ConversationState), nil
 }
 
+type FulfillmentType string
+
+const (
+	FulfillmentTypeDELIVERY FulfillmentType = "DELIVERY"
+	FulfillmentTypePICKUP   FulfillmentType = "PICKUP"
+)
+
+func (e *FulfillmentType) Scan(src interface{}) error {
+	switch s := src.(type) {
+	case []byte:
+		*e = FulfillmentType(s)
+	case string:
+		*e = FulfillmentType(s)
+	default:
+		return fmt.Errorf("unsupported scan type for FulfillmentType: %T", src)
+	}
+	return nil
+}
+
+type NullFulfillmentType struct {
+	FulfillmentType FulfillmentType `json:"FulfillmentType"`
+	Valid           bool            `json:"valid"` // Valid is true if FulfillmentType is not NULL
+}
+
+// Scan implements the Scanner interface.
+func (ns *NullFulfillmentType) Scan(value interface{}) error {
+	if value == nil {
+		ns.FulfillmentType, ns.Valid = "", false
+		return nil
+	}
+	ns.Valid = true
+	return ns.FulfillmentType.Scan(value)
+}
+
+// Value implements the driver Valuer interface.
+func (ns NullFulfillmentType) Value() (driver.Value, error) {
+	if !ns.Valid {
+		return nil, nil
+	}
+	return string(ns.FulfillmentType), nil
+}
+
 type OrderStatus string
 
 const (
@@ -152,20 +194,38 @@ func (ns NullPaymentStatus) Value() (driver.Value, error) {
 }
 
 type Business struct {
-	ID                     string           `json:"id"`
-	Name                   string           `json:"name"`
-	WhatsappPhoneNumberID  string           `json:"whatsapp_phone_number_id"`
-	CreatedAt              pgtype.Timestamp `json:"created_at"`
-	UpdatedAt              pgtype.Timestamp `json:"updated_at"`
-	Currency               string           `json:"currency"`
-	AssistantEnabled       bool             `json:"assistant_enabled"`
-	Category               pgtype.Text      `json:"category"`
-	ConfirmationDelayHours int32            `json:"confirmation_delay_hours"`
-	Location               pgtype.Text      `json:"location"`
-	OwnerPhone             string           `json:"owner_phone"`
-	PaystackRecipientCode  pgtype.Text      `json:"paystack_recipient_code"`
-	PaymentCallbackUrl     pgtype.Text      `json:"payment_callback_url"`
-	TemplateLanguage       string           `json:"template_language"`
+	ID                        string           `json:"id"`
+	Name                      string           `json:"name"`
+	WhatsappPhoneNumberID     string           `json:"whatsapp_phone_number_id"`
+	CreatedAt                 pgtype.Timestamp `json:"created_at"`
+	UpdatedAt                 pgtype.Timestamp `json:"updated_at"`
+	Currency                  string           `json:"currency"`
+	AssistantEnabled          bool             `json:"assistant_enabled"`
+	Category                  pgtype.Text      `json:"category"`
+	ConfirmationDelayHours    int32            `json:"confirmation_delay_hours"`
+	Location                  pgtype.Text      `json:"location"`
+	OwnerPhone                string           `json:"owner_phone"`
+	PaystackRecipientCode     pgtype.Text      `json:"paystack_recipient_code"`
+	PaymentCallbackUrl        pgtype.Text      `json:"payment_callback_url"`
+	TemplateLanguage          string           `json:"template_language"`
+	NewArrivalsTemplateName   pgtype.Text      `json:"new_arrivals_template_name"`
+	LastNewArrivalsNotifiedAt pgtype.Timestamp `json:"last_new_arrivals_notified_at"`
+}
+
+type BusinessLocation struct {
+	ID             string           `json:"id"`
+	BusinessID     string           `json:"business_id"`
+	Name           string           `json:"name"`
+	Address        string           `json:"address"`
+	ShopNumber     pgtype.Text      `json:"shop_number"`
+	Landmark       pgtype.Text      `json:"landmark"`
+	OpeningTime    string           `json:"opening_time"`
+	ClosingTime    string           `json:"closing_time"`
+	OffersDelivery bool             `json:"offers_delivery"`
+	OffersPickup   bool             `json:"offers_pickup"`
+	IsActive       bool             `json:"is_active"`
+	CreatedAt      pgtype.Timestamp `json:"created_at"`
+	UpdatedAt      pgtype.Timestamp `json:"updated_at"`
 }
 
 type Conversation struct {
@@ -191,21 +251,24 @@ type Customer struct {
 	LastContactAt      pgtype.Timestamp `json:"last_contact_at"`
 	CreatedAt          pgtype.Timestamp `json:"created_at"`
 	UpdatedAt          pgtype.Timestamp `json:"updated_at"`
+	MarketingOptIn     bool             `json:"marketing_opt_in"`
 }
 
 type CustomerProfile struct {
-	ID                 string           `json:"id"`
-	CustomerID         string           `json:"customer_id"`
-	Preferences        []byte           `json:"preferences"`
-	DeliveryArea       pgtype.Text      `json:"delivery_area"`
-	AverageOrderValue  pgtype.Numeric   `json:"average_order_value"`
-	OrderFrequencyDays pgtype.Float8    `json:"order_frequency_days"`
-	LastOrderAt        pgtype.Timestamp `json:"last_order_at"`
-	TotalOrders        int32            `json:"total_orders"`
-	TotalSpent         decimal.Decimal  `json:"total_spent"`
-	Sentiment          pgtype.Text      `json:"sentiment"`
-	UpdatedAt          pgtype.Timestamp `json:"updated_at"`
-	LastReengagementAt pgtype.Timestamp `json:"last_reengagement_at"`
+	ID                      string           `json:"id"`
+	CustomerID              string           `json:"customer_id"`
+	Preferences             []byte           `json:"preferences"`
+	DeliveryArea            pgtype.Text      `json:"delivery_area"`
+	AverageOrderValue       pgtype.Numeric   `json:"average_order_value"`
+	OrderFrequencyDays      pgtype.Float8    `json:"order_frequency_days"`
+	LastOrderAt             pgtype.Timestamp `json:"last_order_at"`
+	TotalOrders             int32            `json:"total_orders"`
+	TotalSpent              decimal.Decimal  `json:"total_spent"`
+	Sentiment               pgtype.Text      `json:"sentiment"`
+	UpdatedAt               pgtype.Timestamp `json:"updated_at"`
+	LastReengagementAt      pgtype.Timestamp `json:"last_reengagement_at"`
+	LatePaymentCount        int32            `json:"late_payment_count"`
+	PreferredPaymentNetwork pgtype.Text      `json:"preferred_payment_network"`
 }
 
 type Faq struct {
@@ -234,16 +297,18 @@ type InboundMessage struct {
 }
 
 type Order struct {
-	ID             string           `json:"id"`
-	BusinessID     string           `json:"business_id"`
-	CustomerID     string           `json:"customer_id"`
-	ConversationID pgtype.Text      `json:"conversation_id"`
-	Status         OrderStatus      `json:"status"`
-	TotalAmount    decimal.Decimal  `json:"total_amount"`
-	Currency       string           `json:"currency"`
-	CreatedAt      pgtype.Timestamp `json:"created_at"`
-	UpdatedAt      pgtype.Timestamp `json:"updated_at"`
-	IdempotencyKey pgtype.Text      `json:"idempotency_key"`
+	ID              string           `json:"id"`
+	BusinessID      string           `json:"business_id"`
+	CustomerID      string           `json:"customer_id"`
+	ConversationID  pgtype.Text      `json:"conversation_id"`
+	Status          OrderStatus      `json:"status"`
+	TotalAmount     decimal.Decimal  `json:"total_amount"`
+	Currency        string           `json:"currency"`
+	CreatedAt       pgtype.Timestamp `json:"created_at"`
+	UpdatedAt       pgtype.Timestamp `json:"updated_at"`
+	IdempotencyKey  pgtype.Text      `json:"idempotency_key"`
+	FulfillmentType FulfillmentType  `json:"fulfillment_type"`
+	LocationID      pgtype.Text      `json:"location_id"`
 }
 
 type OrderItem struct {
@@ -270,6 +335,7 @@ type OutboundMessage struct {
 	CreatedAt         pgtype.Timestamp `json:"created_at"`
 	ImageUrl          pgtype.Text      `json:"image_url"`
 	ProductID         pgtype.Text      `json:"product_id"`
+	Seq               pgtype.Int8      `json:"seq"`
 }
 
 type Payment struct {

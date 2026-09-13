@@ -39,38 +39,42 @@ func MountBusinesses(r chi.Router, deps BusinessesDeps) {
 // explicit nulls): every column of the generated model — businesses has no
 // Unsupported columns.
 type businessJSON struct {
-	ID                     string  `json:"id"`
-	Name                   string  `json:"name"`
-	WhatsappPhoneNumberID  string  `json:"whatsappPhoneNumberId"`
-	CreatedAt              isoTime `json:"createdAt"`
-	UpdatedAt              isoTime `json:"updatedAt"`
-	Currency               string  `json:"currency"`
-	AssistantEnabled       bool    `json:"assistantEnabled"`
-	Category               *string `json:"category"`
-	ConfirmationDelayHours int32   `json:"confirmationDelayHours"`
-	Location               *string `json:"location"`
-	OwnerPhone             string  `json:"ownerPhone"`
-	PaystackRecipientCode  *string `json:"paystackRecipientCode"`
-	PaymentCallbackURL     *string `json:"paymentCallbackUrl"`
-	TemplateLanguage       string  `json:"templateLanguage"`
+	ID                        string   `json:"id"`
+	Name                      string   `json:"name"`
+	WhatsappPhoneNumberID     string   `json:"whatsappPhoneNumberId"`
+	CreatedAt                 isoTime  `json:"createdAt"`
+	UpdatedAt                 isoTime  `json:"updatedAt"`
+	Currency                  string   `json:"currency"`
+	AssistantEnabled          bool     `json:"assistantEnabled"`
+	Category                  *string  `json:"category"`
+	ConfirmationDelayHours    int32    `json:"confirmationDelayHours"`
+	Location                  *string  `json:"location"`
+	OwnerPhone                string   `json:"ownerPhone"`
+	PaystackRecipientCode     *string  `json:"paystackRecipientCode"`
+	PaymentCallbackURL        *string  `json:"paymentCallbackUrl"`
+	TemplateLanguage          string   `json:"templateLanguage"`
+	NewArrivalsTemplateName   *string  `json:"newArrivalsTemplateName"`
+	LastNewArrivalsNotifiedAt *isoTime `json:"lastNewArrivalsNotifiedAt"`
 }
 
 func s4p_mapBusiness(b gen.Business) businessJSON {
 	return businessJSON{
-		ID:                     b.ID,
-		Name:                   b.Name,
-		WhatsappPhoneNumberID:  b.WhatsappPhoneNumberID,
-		CreatedAt:              epISO(b.CreatedAt.Time),
-		UpdatedAt:              epISO(b.UpdatedAt.Time),
-		Currency:               b.Currency,
-		AssistantEnabled:       b.AssistantEnabled,
-		Category:               ep_text(b.Category),
-		ConfirmationDelayHours: b.ConfirmationDelayHours,
-		Location:               ep_text(b.Location),
-		OwnerPhone:             b.OwnerPhone,
-		PaystackRecipientCode:  ep_text(b.PaystackRecipientCode),
-		PaymentCallbackURL:     ep_text(b.PaymentCallbackUrl),
-		TemplateLanguage:       b.TemplateLanguage,
+		ID:                        b.ID,
+		Name:                      b.Name,
+		WhatsappPhoneNumberID:     b.WhatsappPhoneNumberID,
+		CreatedAt:                 epISO(b.CreatedAt.Time),
+		UpdatedAt:                 epISO(b.UpdatedAt.Time),
+		Currency:                  b.Currency,
+		AssistantEnabled:          b.AssistantEnabled,
+		Category:                  ep_text(b.Category),
+		ConfirmationDelayHours:    b.ConfirmationDelayHours,
+		Location:                  ep_text(b.Location),
+		OwnerPhone:                b.OwnerPhone,
+		PaystackRecipientCode:     ep_text(b.PaystackRecipientCode),
+		PaymentCallbackURL:        ep_text(b.PaymentCallbackUrl),
+		TemplateLanguage:          b.TemplateLanguage,
+		NewArrivalsTemplateName:   ep_text(b.NewArrivalsTemplateName),
+		LastNewArrivalsNotifiedAt: epISOPtr(b.LastNewArrivalsNotifiedAt),
 	}
 }
 

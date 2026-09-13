@@ -7,10 +7,11 @@
 //	POST /messages/send/template  body {to, templateName, languageCode?}
 //
 // Researched contracts, quoted from source:
-//   - AUTH POSTURE: NONE. apps/api registers no global guard
-//     (app.module.ts providers carry only the ZodValidationPipe APP_PIPE;
-//     the JwtAuthGuard is scoped to MobileApiModule), and the controller has
-//     no guards — both routes are public. The Go mount adds no auth either.
+//   - AUTH: session required. MobileApiModule registers JwtAuthGuard as an
+//     APP_GUARD, which Nest applies app-wide, and this controller is not
+//     @Public; the Go mount sits behind the same auth middleware.
+//   - AUDIT: every attempt is recorded (MessagesService.persistOutboundMessage,
+//     messages_persist.go).
 //   - RESPONSE: Nest @Post default status 201 with
 //     { success: true, data: <Meta API response object> }.
 //   - Meta failure -> WhatsAppService throws Error('Meta API error: ...') ->
@@ -34,6 +35,7 @@ import (
 	"regexp"
 
 	"github.com/go-chi/chi/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/novoapex/novoapex-backend-api/internal/httpx"
 )
@@ -49,6 +51,9 @@ type MessageSender interface {
 type MessagesDeps struct {
 	WA            MessageSender
 	PhoneNumberID string // WHATSAPP_PHONE_NUMBER_ID ("system default" in the source)
+	// Pool, when set, records every send attempt (MessagesService.
+	// persistOutboundMessage).
+	Pool *pgxpool.Pool
 }
 
 // MountMessages registers POST /send/text and POST /send/template on r
@@ -79,6 +84,14 @@ func ms_sendText(d MessagesDeps) http.HandlerFunc {
 
 		slog.Info(fmt.Sprintf("REST trigger: send text to %s", to))
 		result, err := d.WA.SendTextMessageData(r.Context(), d.PhoneNumberID, to, text)
+		ms_persistOutbound(r, d.Pool, ms_outboundRecord{
+			recipientPhone: to,
+			messageType:    "text",
+			textContent:    text,
+			rawPayload:     map[string]any{"messaging_product": "whatsapp", "to": to, "type": "text", "text": map[string]string{"body": text}},
+			metaResponse:   result,
+			sendErr:        err,
+		})
 		if err != nil {
 			httpx.WriteError(w, r, err)
 			return
@@ -102,6 +115,15 @@ func ms_sendTemplate(d MessagesDeps) http.HandlerFunc {
 
 		slog.Info(fmt.Sprintf("REST trigger: send template %q to %s", name, to))
 		result, err := d.WA.SendTemplateMessage(r.Context(), d.PhoneNumberID, to, name, lang)
+		ms_persistOutbound(r, d.Pool, ms_outboundRecord{
+			recipientPhone: to,
+			messageType:    "template",
+			templateName:   name,
+			rawPayload: map[string]any{"messaging_product": "whatsapp", "to": to, "type": "template",
+				"template": map[string]any{"name": name, "language": map[string]string{"code": lang}}},
+			metaResponse: result,
+			sendErr:      err,
+		})
 		if err != nil {
 			httpx.WriteError(w, r, err)
 			return
@@ -217,4 +239,15 @@ func ms_boundedString(v any, field string, min, max int) (string, *httpx.FieldIs
 		}
 	}
 	return s, nil
+}
+
+// ms_outboundRecord is PersistOutboundMessageInput (messages.service.ts).
+type ms_outboundRecord struct {
+	recipientPhone string
+	messageType    string
+	textContent    string
+	templateName   string
+	rawPayload     map[string]any
+	metaResponse   map[string]any
+	sendErr        error
 }

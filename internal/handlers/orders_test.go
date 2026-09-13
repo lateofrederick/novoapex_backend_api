@@ -49,7 +49,7 @@ func TestOrdersList(t *testing.T) {
 				t.Fatalf("row[%d] = %v, want %s (orderBy createdAt desc)", i, row["id"], wantOrder[i])
 			}
 
-			wantKeys := "[businessId conversationId createdAt currency customer customerId id idempotencyKey status totalAmount updatedAt]"
+			wantKeys := "[businessId conversationId createdAt currency customer customerId fulfillmentType id idempotencyKey location locationId status totalAmount updatedAt]"
 			if ks := fmt.Sprint(ep_keys(t, row)); ks != wantKeys {
 				t.Errorf("order key set = %s\nwant        %s", ks, wantKeys)
 			}
@@ -63,7 +63,7 @@ func TestOrdersList(t *testing.T) {
 			if cust["id"] != custA.ID || cust["phone"] != custA.Phone {
 				t.Errorf("nested customer = %v/%v, want %s/%s", cust["id"], cust["phone"], custA.ID, custA.Phone)
 			}
-			wantCustKeys := "[acquisitionChannel businessId createdAt firstContactAt id lastContactAt name phone updatedAt]"
+			wantCustKeys := "[acquisitionChannel businessId createdAt firstContactAt id lastContactAt marketingOptIn name phone updatedAt]"
 			if ks := fmt.Sprint(ep_keys(t, cust)); ks != wantCustKeys {
 				t.Errorf("nested customer key set = %s", ks)
 			}
@@ -106,7 +106,7 @@ func TestOrdersList(t *testing.T) {
 		}
 		body := ep_decode(t, rec)
 
-		wantTop := "[businessId conversationId createdAt currency customer customerId id idempotencyKey items status totalAmount updatedAt]"
+		wantTop := "[businessId conversationId createdAt currency customer customerId fulfillmentType id idempotencyKey items location locationId status totalAmount updatedAt]"
 		if ks := fmt.Sprint(ep_keys(t, body)); ks != wantTop {
 			t.Errorf("detail key set = %s\nwant        %s", ks, wantTop)
 		}

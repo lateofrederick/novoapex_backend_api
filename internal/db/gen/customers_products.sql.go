@@ -65,7 +65,7 @@ func (q *Queries) CountProductsOutOfStock(ctx context.Context, businessID string
 }
 
 const getCustomerByIDAndBusiness = `-- name: GetCustomerByIDAndBusiness :one
-SELECT id, business_id, phone, name, acquisition_channel, first_contact_at, last_contact_at, created_at, updated_at
+SELECT id, business_id, phone, name, acquisition_channel, first_contact_at, last_contact_at, created_at, updated_at, marketing_opt_in
 FROM customers
 WHERE id = $1 AND business_id = $2
 `
@@ -88,34 +88,20 @@ func (q *Queries) GetCustomerByIDAndBusiness(ctx context.Context, arg GetCustome
 		&i.LastContactAt,
 		&i.CreatedAt,
 		&i.UpdatedAt,
+		&i.MarketingOptIn,
 	)
 	return i, err
 }
 
 const getCustomerProfileByCustomerID = `-- name: GetCustomerProfileByCustomerID :one
-SELECT id, customer_id, preferences, delivery_area, average_order_value, order_frequency_days, last_order_at, last_reengagement_at, total_orders, total_spent, sentiment, updated_at
+SELECT id, customer_id, preferences, delivery_area, average_order_value, order_frequency_days, last_order_at, total_orders, total_spent, sentiment, updated_at, last_reengagement_at, late_payment_count, preferred_payment_network
 FROM customer_profiles
 WHERE customer_id = $1
 `
 
-type GetCustomerProfileByCustomerIDRow struct {
-	ID                 string           `json:"id"`
-	CustomerID         string           `json:"customer_id"`
-	Preferences        []byte           `json:"preferences"`
-	DeliveryArea       pgtype.Text      `json:"delivery_area"`
-	AverageOrderValue  pgtype.Numeric   `json:"average_order_value"`
-	OrderFrequencyDays pgtype.Float8    `json:"order_frequency_days"`
-	LastOrderAt        pgtype.Timestamp `json:"last_order_at"`
-	LastReengagementAt pgtype.Timestamp `json:"last_reengagement_at"`
-	TotalOrders        int32            `json:"total_orders"`
-	TotalSpent         decimal.Decimal  `json:"total_spent"`
-	Sentiment          pgtype.Text      `json:"sentiment"`
-	UpdatedAt          pgtype.Timestamp `json:"updated_at"`
-}
-
-func (q *Queries) GetCustomerProfileByCustomerID(ctx context.Context, customerID string) (GetCustomerProfileByCustomerIDRow, error) {
+func (q *Queries) GetCustomerProfileByCustomerID(ctx context.Context, customerID string) (CustomerProfile, error) {
 	row := q.db.QueryRow(ctx, getCustomerProfileByCustomerID, customerID)
-	var i GetCustomerProfileByCustomerIDRow
+	var i CustomerProfile
 	err := row.Scan(
 		&i.ID,
 		&i.CustomerID,
@@ -124,11 +110,13 @@ func (q *Queries) GetCustomerProfileByCustomerID(ctx context.Context, customerID
 		&i.AverageOrderValue,
 		&i.OrderFrequencyDays,
 		&i.LastOrderAt,
-		&i.LastReengagementAt,
 		&i.TotalOrders,
 		&i.TotalSpent,
 		&i.Sentiment,
 		&i.UpdatedAt,
+		&i.LastReengagementAt,
+		&i.LatePaymentCount,
+		&i.PreferredPaymentNetwork,
 	)
 	return i, err
 }
@@ -185,7 +173,7 @@ func (q *Queries) GetProductByIDAndBusiness(ctx context.Context, arg GetProductB
 
 const listCustomersByBusiness = `-- name: ListCustomersByBusiness :many
 
-SELECT id, business_id, phone, name, acquisition_channel, first_contact_at, last_contact_at, created_at, updated_at
+SELECT id, business_id, phone, name, acquisition_channel, first_contact_at, last_contact_at, created_at, updated_at, marketing_opt_in
 FROM customers
 WHERE business_id = $1
 ORDER BY last_contact_at DESC
@@ -222,6 +210,7 @@ func (q *Queries) ListCustomersByBusiness(ctx context.Context, arg ListCustomers
 			&i.LastContactAt,
 			&i.CreatedAt,
 			&i.UpdatedAt,
+			&i.MarketingOptIn,
 		); err != nil {
 			return nil, err
 		}

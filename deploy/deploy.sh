@@ -18,10 +18,10 @@ Commands:
   down      Stop the stack (data volumes preserved)
   status    Service states + health
   logs      Follow logs for a service: ./deploy.sh logs go-api
-  migrate   Apply schema baseline (no-op when already applied)
+  migrate   Apply pending schema migrations (no-op when current)
   health    Curl the api health endpoints through caddy
 
-Rollback to the Node stack is documented in novoapex/docs/rollback-go-cutover.md.
+Migrations run automatically (the migrate service) before go-api and go-worker start.
 EOF
 }
 

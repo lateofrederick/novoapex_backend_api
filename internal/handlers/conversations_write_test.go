@@ -2,8 +2,10 @@ package handlers
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
+	"sync"
 	"testing"
 	"time"
 
@@ -14,27 +16,45 @@ import (
 )
 
 // conversationsWriteTree builds the write subtree the way central integration
-// will (MountConversationsWrite registered on the shared /conversations
+// does (MountConversationsWrite registered on the shared /conversations
 // prefix router).
-func conversationsWriteTree(e *epEnv, pub OutboundPublisher) http.Handler {
+func conversationsWriteTree(e *epEnv, wa *s4o_waSpy) http.Handler {
 	r := chi.NewRouter()
-	MountConversationsWrite(r, ConversationsWriteDeps{Pool: e.Pool, Publisher: pub})
+	deps := ConversationsWriteDeps{Pool: e.Pool}
+	if wa != nil {
+		deps.WA = wa
+	}
+	MountConversationsWrite(r, deps)
 	return r
 }
 
-// s4o_publisherSpy records PublishOutbound calls; every test that cares about
-// enqueueing uses it instead of NullPublisher.
-type s4o_publisherSpy struct {
-	ids []string
-	err error // when set, PublishOutbound fails
+// s4o_waSpy records WhatsApp sends in order; fail makes every send fail the
+// way the Meta client does.
+type s4o_waSpy struct {
+	mu    sync.Mutex
+	sends []string // "<phoneNumberId>|<to>|<text>"
+	fail  error
 }
 
-func (s *s4o_publisherSpy) PublishOutbound(_ context.Context, id string) error {
-	if s.err != nil {
-		return s.err
+func (s *s4o_waSpy) SendTextMessageData(_ context.Context, pnid, to, text string) (map[string]any, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.fail != nil {
+		return nil, s.fail
 	}
-	s.ids = append(s.ids, id)
-	return nil
+	s.sends = append(s.sends, pnid+"|"+to+"|"+text)
+	return map[string]any{
+		"messaging_product": "whatsapp",
+		"messages":          []any{map[string]any{"id": fmt.Sprintf("wamid.s4o.%d", len(s.sends))}},
+	}, nil
+}
+
+func (s *s4o_waSpy) SendImageMessage(context.Context, string, string, string, string) (map[string]any, error) {
+	return nil, errors.New("unexpected image send")
+}
+
+func (s *s4o_waSpy) SendTemplateMessage(context.Context, string, string, string, string) (map[string]any, error) {
+	return nil, errors.New("unexpected template send")
 }
 
 // T4.18/T4.19 POST /conversations/:id/takeover and /release — flag flips,
@@ -117,26 +137,28 @@ func TestS4O_T4_18_19_TakeoverRelease(t *testing.T) {
 	})
 }
 
-// T4.20 POST /conversations/:id/reply — the 24h window gate + persist-then-
-// publish flow (conversation-orchestrator.service.ts:28-81 characterization).
-func TestS4O_T4_20_ReplyWindowGate(t *testing.T) {
+// T4.20 POST /conversations/:id/reply — ConversationsService.reply: send via
+// WhatsApp synchronously, persist the sent OutboundMessage, 500 on Meta error.
+func TestS4O_T4_20_ReplySendsSynchronously(t *testing.T) {
 	e := ep_startTest(t)
 	biz := e.F.Business()
 	now := time.Now().UTC()
-
-	h := ep_mount(t, "/conversations", conversationsWriteTree(e, nil))
 	claims := auth.Claims{Phone: biz.OwnerPhone, BusinessID: biz.ID}
 
-	t.Run("INSIDE window -> pending row + publisher called", func(t *testing.T) {
-		spy := &s4o_publisherSpy{}
-		hh := ep_mount(t, "/conversations", conversationsWriteTree(e, spy))
+	t.Run("sent via Meta; 201 with the persisted sent record", func(t *testing.T) {
+		wa := &s4o_waSpy{}
+		h := ep_mount(t, "/conversations", conversationsWriteTree(e, wa))
 		conv := e.F.Conversation(biz.ID, "+233822000001")
 		ep_seedInboundMessage(t, e, "s4o-in-1", conv.ID, biz.ID, "+233822000001", "hello", now.Add(-time.Hour))
 
-		rec := s4o_do(t, hh, http.MethodPost, "/conversations/"+conv.ID+"/reply",
+		rec := s4o_do(t, h, http.MethodPost, "/conversations/"+conv.ID+"/reply",
 			`{"text":"We have it in stock!"}`, &claims)
 		if rec.Code != http.StatusCreated {
 			t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+		}
+
+		if want := biz.WhatsAppPhoneNumberID + "|+233822000001|We have it in stock!"; len(wa.sends) != 1 || wa.sends[0] != want {
+			t.Fatalf("sends = %v, want [%s]", wa.sends, want)
 		}
 
 		body := ep_decode(t, rec)
@@ -144,117 +166,90 @@ func TestS4O_T4_20_ReplyWindowGate(t *testing.T) {
 		if ks := fmt.Sprint(ep_keys(t, body)); ks != wantKeys {
 			t.Fatalf("key set =\n%s\nwant   \n%s", ks, wantKeys)
 		}
-		if body["status"] != "pending" || body["messageType"] != "text" || body["textContent"] != "We have it in stock!" {
+		if body["status"] != "sent" || body["messageType"] != "text" || body["textContent"] != "We have it in stock!" ||
+			body["recipientPhone"] != "+233822000001" || body["whatsappMessageId"] != "wamid.s4o.1" {
 			t.Errorf("row fields = %v", body)
 		}
-		if v := body["recipientPhone"]; v != "+233822000001" {
-			t.Errorf("recipientPhone = %v (conversation.customerPhone)", v)
-		}
 		rawPayload, _ := body["rawPayload"].(map[string]any)
-		if rawPayload["messaging_product"] != "whatsapp" || rawPayload["to"] != "+233822000001" ||
-			rawPayload["type"] != "text" {
-			t.Errorf("rawPayload envelope = %v", rawPayload)
+		if len(rawPayload) != 2 || rawPayload["type"] != "text" || rawPayload["text"] != "We have it in stock!" {
+			t.Errorf("rawPayload = %v, want {type:'text', text}", rawPayload)
 		}
-		textObj, _ := rawPayload["text"].(map[string]any)
-		if textObj["body"] != "We have it in stock!" {
-			t.Errorf("rawPayload.text = %v, want body %q", rawPayload["text"], "We have it in stock!")
-		}
-		if body["metaResponse"] != nil || body["whatsappMessageId"] != nil {
-			t.Errorf("pending row must carry null metaResponse/whatsappMessageId: %v %v",
-				body["metaResponse"], body["whatsappMessageId"])
-		}
-
-		if len(spy.ids) != 1 {
-			t.Fatalf("publisher calls = %d, want 1", len(spy.ids))
-		}
-		if spy.ids[0] != body["id"].(string) {
-			t.Errorf("published id = %s, want row id %v", spy.ids[0], body["id"])
+		meta, _ := body["metaResponse"].(map[string]any)
+		if meta["messaging_product"] != "whatsapp" {
+			t.Errorf("metaResponse = %v, want the Meta API response", body["metaResponse"])
 		}
 
 		var status string
-		if err := e.DB.QueryRow(`SELECT status FROM outbound_messages WHERE id = $1`, body["id"]).Scan(&status); err != nil || status != "pending" {
+		if err := e.DB.QueryRow(`SELECT status FROM outbound_messages WHERE id = $1`, body["id"]).Scan(&status); err != nil || status != "sent" {
 			t.Errorf("db row status = %q err=%v", status, err)
 		}
 	})
 
-	t.Run("OUTSIDE window -> failed_24h_window_closed row, publisher NOT called", func(t *testing.T) {
-		spy := &s4o_publisherSpy{}
-		hh := ep_mount(t, "/conversations", conversationsWriteTree(e, spy))
+	t.Run("Meta rejection -> 500 envelope and no record left behind", func(t *testing.T) {
+		wa := &s4o_waSpy{fail: errors.New(`Meta API error: {"error":{"code":131047}}`)}
+		h := ep_mount(t, "/conversations", conversationsWriteTree(e, wa))
 		conv := e.F.Conversation(biz.ID, "+233822000002")
-		// Newest inbound backdated past the window via SQL.
 		ep_seedInboundMessage(t, e, "s4o-in-2", conv.ID, biz.ID, "+233822000002", "old msg", now.Add(-25*time.Hour))
 
-		rec := s4o_do(t, hh, http.MethodPost, "/conversations/"+conv.ID+"/reply",
-			`{"text":"compliance blocked"}`, &claims)
+		rec := s4o_do(t, h, http.MethodPost, "/conversations/"+conv.ID+"/reply", `{"text":"too late"}`, &claims)
+		if rec.Code != http.StatusInternalServerError {
+			t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+		}
+		if body := ep_decode(t, rec); body["message"] != "Internal server error" {
+			t.Errorf("body = %v", body)
+		}
+		var n int
+		_ = e.DB.QueryRow(`SELECT COUNT(*) FROM outbound_messages WHERE conversation_id = $1`, conv.ID).Scan(&n)
+		if n != 0 {
+			t.Errorf("an undelivered reply must not be persisted, found %d rows", n)
+		}
+	})
+
+	t.Run("a reply never overtakes an assistant message still queued", func(t *testing.T) {
+		wa := &s4o_waSpy{}
+		h := ep_mount(t, "/conversations", conversationsWriteTree(e, wa))
+		conv := e.F.Conversation(biz.ID, "+233822000003")
+		ep_seedInboundMessage(t, e, "s4o-in-3", conv.ID, biz.ID, "+233822000003", "price?", now.Add(-time.Minute))
+		if _, err := e.DB.Exec(`
+			INSERT INTO outbound_messages (id, business_id, conversation_id, recipient_phone, message_type, text_content, raw_payload, status)
+			VALUES ('s4o-queued', $1, $2, '+233822000003', 'text', 'assistant answer', '{}', 'pending')`, biz.ID, conv.ID); err != nil {
+			t.Fatal(err)
+		}
+
+		rec := s4o_do(t, h, http.MethodPost, "/conversations/"+conv.ID+"/reply", `{"text":"owner follow-up"}`, &claims)
 		if rec.Code != http.StatusCreated {
 			t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
 		}
-
-		body := ep_decode(t, rec)
-		if body["status"] != "failed_24h_window_closed" {
-			t.Errorf("status = %v", body["status"])
+		want := []string{
+			biz.WhatsAppPhoneNumberID + "|+233822000003|assistant answer",
+			biz.WhatsAppPhoneNumberID + "|+233822000003|owner follow-up",
 		}
-		rawPayload, _ := body["rawPayload"].(map[string]any)
-		if len(rawPayload) != 0 {
-			t.Errorf("blocked rawPayload = %v, want empty object {}", rawPayload)
-		}
-
-		if len(spy.ids) != 0 {
-			t.Errorf("publisher must NOT be called for window-blocked sends; got %v", spy.ids)
-		}
-
-		var status string
-		var raw string
-		if err := e.DB.QueryRow(`SELECT status, raw_payload::text FROM outbound_messages WHERE conversation_id = $1`,
-			conv.ID).Scan(&status, &raw); err != nil || status != "failed_24h_window_closed" || raw != "{}" {
-			t.Errorf("db row = status:%q raw:%q err=%v", status, raw, err)
+		if fmt.Sprint(wa.sends) != fmt.Sprint(want) {
+			t.Errorf("send order = %v, want %v", wa.sends, want)
 		}
 	})
 
-	t.Run("no inbound at all -> window closed (latestInbound null)", func(t *testing.T) {
-		spy := &s4o_publisherSpy{}
-		hh := ep_mount(t, "/conversations", conversationsWriteTree(e, spy))
-		conv := e.F.Conversation(biz.ID, "+233822000003")
-
-		rec := s4o_do(t, hh, http.MethodPost, "/conversations/"+conv.ID+"/reply",
-			`{"text":"anyone there?"}`, &claims)
-		body := ep_decode(t, rec)
-		if body["status"] != "failed_24h_window_closed" || len(spy.ids) != 0 {
-			t.Errorf("no-inbound reply = status:%v published:%v", body["status"], spy.ids)
-		}
-	})
-
-	t.Run("boundary: exactly 24h old inbound -> closed (< strict)", func(t *testing.T) {
-		spy := &s4o_publisherSpy{}
-		hh := ep_mount(t, "/conversations", conversationsWriteTree(e, spy))
-		conv := e.F.Conversation(biz.ID, "+233822000004")
-		ep_seedInboundMessage(t, e, "s4o-in-4", conv.ID, biz.ID, "+233822000004", "edge", now.Add(-wo_window-time.Minute))
-
-		rec := s4o_do(t, hh, http.MethodPost, "/conversations/"+conv.ID+"/reply", `{"text":"x"}`, &claims)
-		body := ep_decode(t, rec)
-		if body["status"] != "failed_24h_window_closed" {
-			t.Errorf("status = %v", body["status"])
-		}
-	})
-
-	t.Run("cross-tenant conversation -> 404 Conversation not found", func(t *testing.T) {
+	t.Run("cross-tenant conversation -> 404, nothing sent or persisted", func(t *testing.T) {
+		wa := &s4o_waSpy{}
+		h := ep_mount(t, "/conversations", conversationsWriteTree(e, wa))
 		other := e.F.Business()
 		oConv := e.F.Conversation(other.ID, "+233822000009")
 		ep_seedInboundMessage(t, e, "s4o-in-x", oConv.ID, other.ID, "+233822000009", "hi", now)
 
-		rec := s4o_do(t, h, http.MethodPost, "/conversations/"+oConv.ID+"/reply",
-			`{"text":"steal?"}`, &claims)
+		rec := s4o_do(t, h, http.MethodPost, "/conversations/"+oConv.ID+"/reply", `{"text":"steal?"}`, &claims)
 		if rec.Code != http.StatusNotFound {
 			t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
 		}
 		var n int
 		_ = e.DB.QueryRow(`SELECT COUNT(*) FROM outbound_messages WHERE conversation_id = $1`, oConv.ID).Scan(&n)
-		if n != 0 {
-			t.Errorf("cross-tenant reply must not persist rows, found %d", n)
+		if n != 0 || len(wa.sends) != 0 {
+			t.Errorf("cross-tenant reply: rows=%d sends=%v", n, wa.sends)
 		}
 	})
 
 	t.Run("ReplyDto: missing text -> invalid_type Required; empty -> too_small", func(t *testing.T) {
+		wa := &s4o_waSpy{}
+		h := ep_mount(t, "/conversations", conversationsWriteTree(e, wa))
 		conv := e.F.Conversation(biz.ID, "+233822000005")
 		ep_seedInboundMessage(t, e, "s4o-in-5", conv.ID, biz.ID, "+233822000005", "hi", now)
 
@@ -266,8 +261,8 @@ func TestS4O_T4_20_ReplyWindowGate(t *testing.T) {
 
 		var n int
 		_ = e.DB.QueryRow(`SELECT COUNT(*) FROM outbound_messages WHERE conversation_id = $1`, conv.ID).Scan(&n)
-		if n != 0 {
-			t.Errorf("validation failures must not persist rows, found %d", n)
+		if n != 0 || len(wa.sends) != 0 {
+			t.Errorf("validation failures must not send or persist: rows=%d sends=%v", n, wa.sends)
 		}
 	})
 }

@@ -153,12 +153,8 @@ func s7bStartDB(t *testing.T) *s7bDB {
 	}
 	t.Cleanup(func() { env.Terminate(context.Background()) })
 
-	repoDir, err := harness.NovoApexRepoDir()
-	if err != nil {
-		t.Skipf("novoapex repo not reachable: %v", err)
-	}
-	if err := harness.ApplyPrismaMigrations(ctx, repoDir, env.PostgresDSN); err != nil {
-		t.Fatalf("prisma migrate deploy: %v", err)
+	if err := harness.ApplyBaselineSchema(ctx, env.PostgresDSN); err != nil {
+		t.Fatalf("apply schema: %v", err)
 	}
 
 	pool, err := pgxpool.New(ctx, env.PostgresDSN)

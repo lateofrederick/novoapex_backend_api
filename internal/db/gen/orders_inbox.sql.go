@@ -81,8 +81,38 @@ func (q *Queries) GetConversationIDForBusiness(ctx context.Context, arg GetConve
 	return id, err
 }
 
+const getLocationByID = `-- name: GetLocationByID :one
+SELECT id, business_id, name, address, shop_number, landmark, opening_time,
+       closing_time, offers_delivery, offers_pickup, is_active, created_at, updated_at
+FROM business_locations
+WHERE id = $1
+`
+
+// location for GetOrderByIDAndBusiness's response (mirrors the ordinary
+// locations findOne query — orders_write.go's own lookups stay narrower).
+func (q *Queries) GetLocationByID(ctx context.Context, id string) (BusinessLocation, error) {
+	row := q.db.QueryRow(ctx, getLocationByID, id)
+	var i BusinessLocation
+	err := row.Scan(
+		&i.ID,
+		&i.BusinessID,
+		&i.Name,
+		&i.Address,
+		&i.ShopNumber,
+		&i.Landmark,
+		&i.OpeningTime,
+		&i.ClosingTime,
+		&i.OffersDelivery,
+		&i.OffersPickup,
+		&i.IsActive,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+	)
+	return i, err
+}
+
 const getOrderByIDAndBusiness = `-- name: GetOrderByIDAndBusiness :one
-SELECT id, business_id, customer_id, conversation_id, idempotency_key, status, total_amount, currency, created_at, updated_at
+SELECT id, business_id, customer_id, conversation_id, idempotency_key, status, total_amount, currency, fulfillment_type, location_id, created_at, updated_at
 FROM orders
 WHERE id = $1 AND business_id = $2
 `
@@ -93,20 +123,22 @@ type GetOrderByIDAndBusinessParams struct {
 }
 
 type GetOrderByIDAndBusinessRow struct {
-	ID             string           `json:"id"`
-	BusinessID     string           `json:"business_id"`
-	CustomerID     string           `json:"customer_id"`
-	ConversationID pgtype.Text      `json:"conversation_id"`
-	IdempotencyKey pgtype.Text      `json:"idempotency_key"`
-	Status         OrderStatus      `json:"status"`
-	TotalAmount    decimal.Decimal  `json:"total_amount"`
-	Currency       string           `json:"currency"`
-	CreatedAt      pgtype.Timestamp `json:"created_at"`
-	UpdatedAt      pgtype.Timestamp `json:"updated_at"`
+	ID              string           `json:"id"`
+	BusinessID      string           `json:"business_id"`
+	CustomerID      string           `json:"customer_id"`
+	ConversationID  pgtype.Text      `json:"conversation_id"`
+	IdempotencyKey  pgtype.Text      `json:"idempotency_key"`
+	Status          OrderStatus      `json:"status"`
+	TotalAmount     decimal.Decimal  `json:"total_amount"`
+	Currency        string           `json:"currency"`
+	FulfillmentType FulfillmentType  `json:"fulfillment_type"`
+	LocationID      pgtype.Text      `json:"location_id"`
+	CreatedAt       pgtype.Timestamp `json:"created_at"`
+	UpdatedAt       pgtype.Timestamp `json:"updated_at"`
 }
 
-// findOne: include customer + items.product. The order row is already
-// business-scoped; its items join out from that verified order id.
+// findOne: include customer + items.product + location. The order row is
+// already business-scoped; its items join out from that verified order id.
 func (q *Queries) GetOrderByIDAndBusiness(ctx context.Context, arg GetOrderByIDAndBusinessParams) (GetOrderByIDAndBusinessRow, error) {
 	row := q.db.QueryRow(ctx, getOrderByIDAndBusiness, arg.ID, arg.BusinessID)
 	var i GetOrderByIDAndBusinessRow
@@ -119,6 +151,8 @@ func (q *Queries) GetOrderByIDAndBusiness(ctx context.Context, arg GetOrderByIDA
 		&i.Status,
 		&i.TotalAmount,
 		&i.Currency,
+		&i.FulfillmentType,
+		&i.LocationID,
 		&i.CreatedAt,
 		&i.UpdatedAt,
 	)
@@ -130,6 +164,7 @@ SELECT v.id, v.business_id, v.customer_id, v.customer_phone, v.state,
        v.is_escalated_to_human, v.language, v.escalation_reason, v.created_at, v.updated_at,
        c.id AS c_id, c.business_id AS c_business_id, c.phone AS c_phone, c.name AS c_name,
        c.acquisition_channel AS c_acquisition_channel,
+       c.marketing_opt_in AS c_marketing_opt_in,
        c.first_contact_at AS c_first_contact_at,
        c.last_contact_at AS c_last_contact_at,
        c.created_at AS c_created_at, c.updated_at AS c_updated_at
@@ -162,6 +197,7 @@ type ListEscalatedConversationsWithCustomerRow struct {
 	CPhone              pgtype.Text       `json:"c_phone"`
 	CName               pgtype.Text       `json:"c_name"`
 	CAcquisitionChannel pgtype.Text       `json:"c_acquisition_channel"`
+	CMarketingOptIn     pgtype.Bool       `json:"c_marketing_opt_in"`
 	CFirstContactAt     pgtype.Timestamp  `json:"c_first_contact_at"`
 	CLastContactAt      pgtype.Timestamp  `json:"c_last_contact_at"`
 	CCreatedAt          pgtype.Timestamp  `json:"c_created_at"`
@@ -195,6 +231,7 @@ func (q *Queries) ListEscalatedConversationsWithCustomer(ctx context.Context, ar
 			&i.CPhone,
 			&i.CName,
 			&i.CAcquisitionChannel,
+			&i.CMarketingOptIn,
 			&i.CFirstContactAt,
 			&i.CLastContactAt,
 			&i.CCreatedAt,
@@ -290,14 +327,22 @@ const listOrdersWithCustomer = `-- name: ListOrdersWithCustomer :many
 
 
 SELECT o.id, o.business_id, o.customer_id, o.conversation_id, o.idempotency_key,
-       o.status, o.total_amount, o.currency, o.created_at, o.updated_at,
+       o.status, o.total_amount, o.currency, o.fulfillment_type, o.location_id,
+       o.created_at, o.updated_at,
        c.id AS c_id, c.business_id AS c_business_id, c.phone AS c_phone, c.name AS c_name,
        c.acquisition_channel AS c_acquisition_channel,
+       c.marketing_opt_in AS c_marketing_opt_in,
        c.first_contact_at AS c_first_contact_at,
        c.last_contact_at AS c_last_contact_at,
-       c.created_at AS c_created_at, c.updated_at AS c_updated_at
+       c.created_at AS c_created_at, c.updated_at AS c_updated_at,
+       l.id AS l_id, l.business_id AS l_business_id, l.name AS l_name, l.address AS l_address,
+       l.shop_number AS l_shop_number, l.landmark AS l_landmark, l.opening_time AS l_opening_time,
+       l.closing_time AS l_closing_time, l.offers_delivery AS l_offers_delivery,
+       l.offers_pickup AS l_offers_pickup, l.is_active AS l_is_active,
+       l.created_at AS l_created_at, l.updated_at AS l_updated_at
 FROM orders o
 LEFT JOIN customers c ON c.id = o.customer_id
+LEFT JOIN business_locations l ON l.id = o.location_id
 WHERE o.business_id = $1
 ORDER BY o.created_at DESC
 LIMIT $2 OFFSET $3
@@ -318,6 +363,8 @@ type ListOrdersWithCustomerRow struct {
 	Status              OrderStatus      `json:"status"`
 	TotalAmount         decimal.Decimal  `json:"total_amount"`
 	Currency            string           `json:"currency"`
+	FulfillmentType     FulfillmentType  `json:"fulfillment_type"`
+	LocationID          pgtype.Text      `json:"location_id"`
 	CreatedAt           pgtype.Timestamp `json:"created_at"`
 	UpdatedAt           pgtype.Timestamp `json:"updated_at"`
 	CID                 pgtype.Text      `json:"c_id"`
@@ -325,10 +372,24 @@ type ListOrdersWithCustomerRow struct {
 	CPhone              pgtype.Text      `json:"c_phone"`
 	CName               pgtype.Text      `json:"c_name"`
 	CAcquisitionChannel pgtype.Text      `json:"c_acquisition_channel"`
+	CMarketingOptIn     pgtype.Bool      `json:"c_marketing_opt_in"`
 	CFirstContactAt     pgtype.Timestamp `json:"c_first_contact_at"`
 	CLastContactAt      pgtype.Timestamp `json:"c_last_contact_at"`
 	CCreatedAt          pgtype.Timestamp `json:"c_created_at"`
 	CUpdatedAt          pgtype.Timestamp `json:"c_updated_at"`
+	LID                 pgtype.Text      `json:"l_id"`
+	LBusinessID         pgtype.Text      `json:"l_business_id"`
+	LName               pgtype.Text      `json:"l_name"`
+	LAddress            pgtype.Text      `json:"l_address"`
+	LShopNumber         pgtype.Text      `json:"l_shop_number"`
+	LLandmark           pgtype.Text      `json:"l_landmark"`
+	LOpeningTime        pgtype.Text      `json:"l_opening_time"`
+	LClosingTime        pgtype.Text      `json:"l_closing_time"`
+	LOffersDelivery     pgtype.Bool      `json:"l_offers_delivery"`
+	LOffersPickup       pgtype.Bool      `json:"l_offers_pickup"`
+	LIsActive           pgtype.Bool      `json:"l_is_active"`
+	LCreatedAt          pgtype.Timestamp `json:"l_created_at"`
+	LUpdatedAt          pgtype.Timestamp `json:"l_updated_at"`
 }
 
 // Orders + inbox (conversations/messages) read models (Stage 2).
@@ -337,7 +398,8 @@ type ListOrdersWithCustomerRow struct {
 // service (conversations.service.ts verifies {id, businessId} first).
 // raw_payload/meta_response stay jsonb -> []byte; no vector columns here.
 // Orders -------------------------------------------------------------------
-// orders.service findAll: include customer:true, orderBy createdAt desc.
+// orders.service findAll: include customer:true, location:true (delivery-vs-
+// pickup port, this session's Node work), orderBy createdAt desc.
 func (q *Queries) ListOrdersWithCustomer(ctx context.Context, arg ListOrdersWithCustomerParams) ([]ListOrdersWithCustomerRow, error) {
 	rows, err := q.db.Query(ctx, listOrdersWithCustomer, arg.BusinessID, arg.Limit, arg.Offset)
 	if err != nil {
@@ -356,6 +418,8 @@ func (q *Queries) ListOrdersWithCustomer(ctx context.Context, arg ListOrdersWith
 			&i.Status,
 			&i.TotalAmount,
 			&i.Currency,
+			&i.FulfillmentType,
+			&i.LocationID,
 			&i.CreatedAt,
 			&i.UpdatedAt,
 			&i.CID,
@@ -363,10 +427,24 @@ func (q *Queries) ListOrdersWithCustomer(ctx context.Context, arg ListOrdersWith
 			&i.CPhone,
 			&i.CName,
 			&i.CAcquisitionChannel,
+			&i.CMarketingOptIn,
 			&i.CFirstContactAt,
 			&i.CLastContactAt,
 			&i.CCreatedAt,
 			&i.CUpdatedAt,
+			&i.LID,
+			&i.LBusinessID,
+			&i.LName,
+			&i.LAddress,
+			&i.LShopNumber,
+			&i.LLandmark,
+			&i.LOpeningTime,
+			&i.LClosingTime,
+			&i.LOffersDelivery,
+			&i.LOffersPickup,
+			&i.LIsActive,
+			&i.LCreatedAt,
+			&i.LUpdatedAt,
 		); err != nil {
 			return nil, err
 		}

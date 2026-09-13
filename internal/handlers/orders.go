@@ -28,21 +28,24 @@ func NewOrders(pool *pgxpool.Pool) http.Handler {
 }
 
 type orderBaseJSON struct {
-	ID             string       `json:"id"`
-	BusinessID     string       `json:"businessId"`
-	CustomerID     string       `json:"customerId"`
-	ConversationID *string      `json:"conversationId"`
-	IdempotencyKey *string      `json:"idempotencyKey"`
-	Status         string       `json:"status"`
-	TotalAmount    money.Number `json:"totalAmount"`
-	Currency       string       `json:"currency"`
-	CreatedAt      isoTime      `json:"createdAt"`
-	UpdatedAt      isoTime      `json:"updatedAt"`
+	ID              string       `json:"id"`
+	BusinessID      string       `json:"businessId"`
+	CustomerID      string       `json:"customerId"`
+	ConversationID  *string      `json:"conversationId"`
+	IdempotencyKey  *string      `json:"idempotencyKey"`
+	Status          string       `json:"status"`
+	TotalAmount     money.Number `json:"totalAmount"`
+	Currency        string       `json:"currency"`
+	FulfillmentType string       `json:"fulfillmentType"`
+	LocationID      *string      `json:"locationId"`
+	CreatedAt       isoTime      `json:"createdAt"`
+	UpdatedAt       isoTime      `json:"updatedAt"`
 }
 
 type orderListJSON struct {
 	orderBaseJSON
 	Customer *customerJSON `json:"customer"`
+	Location *locationJSON `json:"location"`
 }
 
 type orderItemJSON struct {
@@ -77,10 +80,11 @@ type productPlainJSON struct {
 type orderDetailJSON struct {
 	orderBaseJSON
 	Customer *customerJSON   `json:"customer"`
+	Location *locationJSON   `json:"location"`
 	Items    []orderItemJSON `json:"items"`
 }
 
-func ep_customerJoined(cID, cBusinessID pgtype.Text, phone, name, channel pgtype.Text, first, last, created, updated pgtype.Timestamp) *customerJSON {
+func ep_customerJoined(cID, cBusinessID pgtype.Text, phone, name, channel pgtype.Text, marketingOptIn pgtype.Bool, first, last, created, updated pgtype.Timestamp) *customerJSON {
 	if !cID.Valid {
 		return nil
 	}
@@ -90,12 +94,39 @@ func ep_customerJoined(cID, cBusinessID pgtype.Text, phone, name, channel pgtype
 		Phone:              phone.String,
 		Name:               ep_text(name),
 		AcquisitionChannel: ep_text(channel),
+		MarketingOptIn:     marketingOptIn.Bool,
 		FirstContactAt:     epISO(first.Time),
 		LastContactAt:      epISO(last.Time),
 		CreatedAt:          epISO(created.Time),
 		UpdatedAt:          epISO(updated.Time),
 	}
 	return &c
+}
+
+// ep_locationJoined mirrors ep_customerJoined for the location LEFT JOIN
+// nested under an order — nil when the order has no locationId (delivery, or
+// a pickup whose location never resolved).
+func ep_locationJoined(lID, businessID, name, address, shopNumber, landmark, openingTime, closingTime pgtype.Text,
+	offersDelivery, offersPickup, isActive pgtype.Bool, createdAt, updatedAt pgtype.Timestamp) *locationJSON {
+	if !lID.Valid {
+		return nil
+	}
+	l := locationJSON{
+		ID:             lID.String,
+		BusinessID:     businessID.String,
+		Name:           name.String,
+		Address:        address.String,
+		ShopNumber:     ep_text(shopNumber),
+		Landmark:       ep_text(landmark),
+		OpeningTime:    openingTime.String,
+		ClosingTime:    closingTime.String,
+		OffersDelivery: offersDelivery.Bool,
+		OffersPickup:   offersPickup.Bool,
+		IsActive:       isActive.Bool,
+		CreatedAt:      epISO(createdAt.Time),
+		UpdatedAt:      epISO(updatedAt.Time),
+	}
+	return &l
 }
 
 // ordersList ports OrdersService.findAll (orders.service.ts:11-35):
@@ -131,27 +162,31 @@ func ordersList(pool *pgxpool.Pool) http.HandlerFunc {
 		data := make([]orderListJSON, 0, len(rows))
 		for _, row := range rows {
 			data = append(data, orderListJSON{
-				orderBaseJSON: ep_orderBase(row.ID, row.BusinessID, row.CustomerID, row.ConversationID, row.IdempotencyKey, row.Status, row.TotalAmount, row.Currency, row.CreatedAt, row.UpdatedAt),
-				Customer: ep_customerJoined(row.CID, row.CBusinessID, row.CPhone, row.CName, row.CAcquisitionChannel,
+				orderBaseJSON: ep_orderBase(row.ID, row.BusinessID, row.CustomerID, row.ConversationID, row.IdempotencyKey, row.Status, row.TotalAmount, row.Currency, row.FulfillmentType, row.LocationID, row.CreatedAt, row.UpdatedAt),
+				Customer: ep_customerJoined(row.CID, row.CBusinessID, row.CPhone, row.CName, row.CAcquisitionChannel, row.CMarketingOptIn,
 					row.CFirstContactAt, row.CLastContactAt, row.CCreatedAt, row.CUpdatedAt),
+				Location: ep_locationJoined(row.LID, row.LBusinessID, row.LName, row.LAddress, row.LShopNumber, row.LLandmark,
+					row.LOpeningTime, row.LClosingTime, row.LOffersDelivery, row.LOffersPickup, row.LIsActive, row.LCreatedAt, row.LUpdatedAt),
 			})
 		}
 		_ = httpx.WritePaginated(w, http.StatusOK, data, int(total), pq.Page, pq.Limit)
 	}
 }
 
-func ep_orderBase(id, businessID, customerID string, conversationID, idempotencyKey pgtype.Text, status gen.OrderStatus, totalAmount decimal.Decimal, currency string, createdAt, updatedAt pgtype.Timestamp) orderBaseJSON {
+func ep_orderBase(id, businessID, customerID string, conversationID, idempotencyKey pgtype.Text, status gen.OrderStatus, totalAmount decimal.Decimal, currency string, fulfillmentType gen.FulfillmentType, locationID pgtype.Text, createdAt, updatedAt pgtype.Timestamp) orderBaseJSON {
 	return orderBaseJSON{
-		ID:             id,
-		BusinessID:     businessID,
-		CustomerID:     customerID,
-		ConversationID: ep_text(conversationID),
-		IdempotencyKey: ep_text(idempotencyKey),
-		Status:         string(status),
-		TotalAmount:    ep_num(totalAmount),
-		Currency:       currency,
-		CreatedAt:      epISO(createdAt.Time),
-		UpdatedAt:      epISO(updatedAt.Time),
+		ID:              id,
+		BusinessID:      businessID,
+		CustomerID:      customerID,
+		ConversationID:  ep_text(conversationID),
+		IdempotencyKey:  ep_text(idempotencyKey),
+		Status:          string(status),
+		TotalAmount:     ep_num(totalAmount),
+		Currency:        currency,
+		FulfillmentType: string(fulfillmentType),
+		LocationID:      ep_text(locationID),
+		CreatedAt:       epISO(createdAt.Time),
+		UpdatedAt:       epISO(updatedAt.Time),
 	}
 }
 
@@ -270,20 +305,36 @@ func ordersGet(pool *pgxpool.Pool) http.HandlerFunc {
 			customer = &cj
 		}
 
+		var location *locationJSON
+		if row.LocationID.Valid {
+			locRow, lerr := q.GetLocationByID(r.Context(), row.LocationID.String)
+			if lerr != nil && !errors.Is(lerr, pgx.ErrNoRows) {
+				httpx.WriteError(w, r, lerr)
+				return
+			}
+			if lerr == nil {
+				lj := ep_location(locRow)
+				location = &lj
+			}
+		}
+
 		detail := orderDetailJSON{
 			orderBaseJSON: orderBaseJSON{
-				ID:             row.ID,
-				BusinessID:     row.BusinessID,
-				CustomerID:     row.CustomerID,
-				ConversationID: ep_text(row.ConversationID),
-				IdempotencyKey: ep_text(row.IdempotencyKey),
-				Status:         string(row.Status),
-				TotalAmount:    ep_num(row.TotalAmount),
-				Currency:       row.Currency,
-				CreatedAt:      epISO(row.CreatedAt.Time),
-				UpdatedAt:      epISO(row.UpdatedAt.Time),
+				ID:              row.ID,
+				BusinessID:      row.BusinessID,
+				CustomerID:      row.CustomerID,
+				ConversationID:  ep_text(row.ConversationID),
+				IdempotencyKey:  ep_text(row.IdempotencyKey),
+				Status:          string(row.Status),
+				TotalAmount:     ep_num(row.TotalAmount),
+				Currency:        row.Currency,
+				FulfillmentType: string(row.FulfillmentType),
+				LocationID:      ep_text(row.LocationID),
+				CreatedAt:       epISO(row.CreatedAt.Time),
+				UpdatedAt:       epISO(row.UpdatedAt.Time),
 			},
 			Customer: customer,
+			Location: location,
 			Items:    items,
 		}
 		_ = httpx.WriteJSON(w, http.StatusOK, detail)

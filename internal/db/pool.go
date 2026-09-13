@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -13,6 +14,8 @@ type PoolConfig struct {
 	MaxConns    int32
 	IdleTimeout time.Duration
 	ConnTimeout time.Duration
+	// Tracer, when set, observes every query (Sentry DB spans).
+	Tracer pgx.QueryTracer
 }
 
 func NewPool(ctx context.Context, databaseURL string, cfg PoolConfig) (*pgxpool.Pool, error) {
@@ -46,6 +49,7 @@ func buildPoolConfig(databaseURL string, cfg PoolConfig) (*pgxpool.Config, error
 	if err != nil {
 		return nil, fmt.Errorf("db: parse database URL: %w", err)
 	}
+	NormalizeRuntimeParams(poolCfg.ConnConfig.RuntimeParams)
 
 	if cfg.MaxConns > 0 {
 		poolCfg.MaxConns = cfg.MaxConns
@@ -56,5 +60,26 @@ func buildPoolConfig(databaseURL string, cfg PoolConfig) (*pgxpool.Config, error
 	if cfg.ConnTimeout > 0 {
 		poolCfg.ConnConfig.ConnectTimeout = cfg.ConnTimeout
 	}
+	if cfg.Tracer != nil {
+		poolCfg.ConnConfig.Tracer = cfg.Tracer
+	}
 	return poolCfg, nil
+}
+
+// NormalizeRuntimeParams adjusts the startup parameters pgx derives from the
+// connection URL:
+//
+//   - "schema" is a Prisma-only URL option (…?schema=public). pgx forwards
+//     unknown query keys to Postgres as startup parameters, which rejects them
+//     with "unrecognized configuration parameter" — so Prisma-style
+//     DATABASE_URLs would fail to connect. public is the default schema.
+//   - Every timestamp column is TIMESTAMP(3) WITHOUT TIME ZONE holding UTC
+//     wall time. Pinning the session to UTC keeps CURRENT_TIMESTAMP/now() on
+//     that clock regardless of the server's TimeZone; an explicit timezone in
+//     the URL still wins.
+func NormalizeRuntimeParams(params map[string]string) {
+	delete(params, "schema")
+	if _, ok := params["timezone"]; !ok {
+		params["timezone"] = "UTC"
+	}
 }

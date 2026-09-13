@@ -7,11 +7,11 @@
 # Bring-up:  cp .env.example .env && edit, then
 #            docker compose --env-file .env up -d --build
 #
-# Migrations: Prisma owns the schema until Stage 9 (ADR: plan §A.3). Run them
-# once per deploy from a novoapex checkout:
-#   docker compose --profile migrate --env-file .env run --rm migrate
+# Migrations: the `migrate` service applies internal/db/migrations on every
+# `up` and must complete before go-api and go-worker start (idempotent).
 #
-# Queue dashboard: http://<host>/admin/queues (basic auth from BULL_BOARD_*)
+# Queue dashboard: https://<host>/admin/queues, served by go-api behind basic
+# auth from BULL_BOARD_* (disabled with 503 until both are set).
 name: novoapex-go
 
 services:
@@ -22,8 +22,6 @@ services:
     depends_on:
       go-api:
         condition: service_healthy
-      asynqmon-auth:
-        condition: service_started
     environment:
       - DOMAIN=${DOMAIN:?Set DOMAIN in .env}
     ports:
@@ -78,9 +76,23 @@ services:
       - SENTRY_DSN=${SENTRY_DSN:-}
       - SENTRY_ENVIRONMENT=${SENTRY_ENVIRONMENT:-production}
       - SENTRY_RELEASE=${SENTRY_RELEASE:-}
+      - SENTRY_TRACES_SAMPLE_RATE=${SENTRY_TRACES_SAMPLE_RATE:-0.1}
+      - SENTRY_PROFILES_SAMPLE_RATE=${SENTRY_PROFILES_SAMPLE_RATE:-1.0}
+      - SENTRY_SEND_PII=${SENTRY_SEND_PII:-false}
       - LOG_LEVEL=${LOG_LEVEL:-info}
+      - PAYSTACK_BASE_URL=${PAYSTACK_BASE_URL:-https://api.paystack.co}
+      - BULL_BOARD_USER=${BULL_BOARD_USER:-}
+      - BULL_BOARD_PASSWORD=${BULL_BOARD_PASSWORD:-}
+      - ENABLE_SWAGGER=${ENABLE_SWAGGER:-false}
     expose:
       - "3100"
+    # caddy waits on service_healthy, which requires a healthcheck here.
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:3100/health/live"]
+      interval: 10s
+      timeout: 3s
+      retries: 12
+      start_period: 10s
 
   go-worker:
     build:
@@ -99,6 +111,7 @@ services:
       - NODE_ENV=production
       - DATABASE_URL=postgresql://postgres:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}@db:5432/novoapex?schema=public
       - DATABASE_POOL_MAX=${WORKER_DATABASE_POOL_MAX:-10}
+      - WORKER_CONCURRENCY=${WORKER_CONCURRENCY:-10}
       - REDIS_HOST=redis
       - REDIS_PORT=6379
       - REDIS_PASSWORD=${REDIS_PASSWORD:?Set REDIS_PASSWORD in .env}
@@ -118,39 +131,11 @@ services:
       - SMTP_PASS=${SMTP_PASS:-}
       - SENTRY_DSN=${SENTRY_DSN:-}
       - SENTRY_ENVIRONMENT=${SENTRY_ENVIRONMENT:-production}
+      - SENTRY_RELEASE=${SENTRY_RELEASE:-}
+      - SENTRY_TRACES_SAMPLE_RATE=${SENTRY_TRACES_SAMPLE_RATE:-0.1}
+      - SENTRY_PROFILES_SAMPLE_RATE=${SENTRY_PROFILES_SAMPLE_RATE:-1.0}
+      - SENTRY_SEND_PII=${SENTRY_SEND_PII:-false}
       - LOG_LEVEL=${LOG_LEVEL:-info}
-      # - WORKER_CONCURRENCY=10
-
-  asynqmon:
-    image: hibiken/asynqmon:v0.7.2
-    container_name: novoapex_go_asynqmon
-    restart: unless-stopped
-    depends_on:
-      redis:
-        condition: service_healthy
-    environment:
-      - REDIS_ADDR=redis:6379
-      - REDIS_PASSWORD=${REDIS_PASSWORD:?Set REDIS_PASSWORD in .env}
-
-  asynqmon-auth:
-    image: caddy:2-alpine
-    container_name: novoapex_go_asynqmon_auth
-    restart: unless-stopped
-    depends_on:
-      - asynqmon
-    environment:
-      - BULL_BOARD_USER=${BULL_BOARD_USER:?Set BULL_BOARD_USER in .env}
-      - BULL_BOARD_PASSWORD=${BULL_BOARD_PASSWORD:?Set BULL_BOARD_PASSWORD in .env}
-    command: >
-      sh -c 'HASH=$$(caddy hash-password --plaintext "$$BULL_BOARD_PASSWORD") &&
-             printf "%s\n" \
-               ":8081 {" \
-               "  basic_auth {" \
-               "    \"$$BULL_BOARD_USER\" \"$$HASH\"" \
-               "  }" \
-               "  reverse_proxy asynqmon:8080" \
-               "}" > /tmp/Caddyfile &&
-             exec caddy run --config /tmp/Caddyfile --adapter caddyfile'
 
   db:
     image: pgvector/pgvector:pg15

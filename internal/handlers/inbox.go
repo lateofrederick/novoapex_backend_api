@@ -118,7 +118,7 @@ func inboxHandoffs(pool *pgxpool.Pool) http.HandlerFunc {
 
 		data := make([]conversationJSON, 0, len(rows))
 		for _, row := range rows {
-			cj := ep_customerJoined(row.CID, row.CBusinessID, row.CPhone, row.CName, row.CAcquisitionChannel,
+			cj := ep_customerJoined(row.CID, row.CBusinessID, row.CPhone, row.CName, row.CAcquisitionChannel, row.CMarketingOptIn,
 				row.CFirstContactAt, row.CLastContactAt, row.CCreatedAt, row.CUpdatedAt)
 			data = append(data, conversationJSON{
 				ID:                 row.ID,

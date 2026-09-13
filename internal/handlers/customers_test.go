@@ -72,7 +72,7 @@ func TestCustomersList(t *testing.T) {
 				t.Errorf("second=%v want %s", second["id"], old2.ID)
 			}
 
-			wantKeys := "[acquisitionChannel businessId createdAt firstContactAt id lastContactAt name phone updatedAt]"
+			wantKeys := "[acquisitionChannel businessId createdAt firstContactAt id lastContactAt marketingOptIn name phone updatedAt]"
 			if ks := fmt.Sprint(ep_keys(t, first)); ks != wantKeys {
 				t.Errorf("customer key set = %s, want %s", ks, wantKeys)
 			}
@@ -219,7 +219,7 @@ func TestCustomersFindOne(t *testing.T) {
 		}
 		body := ep_decode(t, rec)
 
-		wantTop := "[acquisitionChannel businessId createdAt firstContactAt id lastContactAt name phone profile updatedAt]"
+		wantTop := "[acquisitionChannel businessId createdAt firstContactAt id lastContactAt marketingOptIn name phone profile updatedAt]"
 		if ks := fmt.Sprint(ep_keys(t, body)); ks != wantTop {
 			t.Errorf("customer key set = %s, want %s", ks, wantTop)
 		}
@@ -228,7 +228,7 @@ func TestCustomersFindOne(t *testing.T) {
 		}
 
 		profile := body["profile"].(map[string]any)
-		wantProfile := "[averageOrderValue customerId deliveryArea id lastOrderAt lastReengagementAt orderFrequencyDays preferences sentiment totalOrders totalSpent updatedAt]"
+		wantProfile := "[averageOrderValue customerId deliveryArea id lastOrderAt lastReengagementAt latePaymentCount orderFrequencyDays preferences preferredPaymentNetwork sentiment totalOrders totalSpent updatedAt]"
 		if ks := fmt.Sprint(ep_keys(t, profile)); ks != wantProfile {
 			t.Errorf("profile key set = %s, want %s", ks, wantProfile)
 		}

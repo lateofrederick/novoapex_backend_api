@@ -4,9 +4,12 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"time"
 
 	"github.com/go-chi/chi/v5"
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/novoapex/novoapex-backend-api/internal/db/gen"
@@ -27,14 +30,20 @@ type OrdersWriteDeps struct {
 }
 
 // orderFulfillmentStatuses is UpdateOrderDto's z.enum set
-// (dto/update-order.dto.ts:5): the OrderStatus values a vendor may set via
-// fulfillment — deliberately NOT the full DB enum (no PROCESSING/SHIPPED/
-// DELIVERED/CANCELLED).
+// (dto/update-order.dto.ts:5): the full OrderStatus enum. Originally limited
+// to PENDING/CONFIRMED/PAYMENT_PENDING/PAID — that meant DELIVERED (and
+// PROCESSING/SHIPPED/CANCELLED) could never actually be set through this
+// endpoint, which silently blocked the delivery-confirmation follow-up from
+// ever being reachable. Expanded to the full set to fix that.
 var orderFulfillmentStatuses = []gen.OrderStatus{
 	gen.OrderStatusPENDING,
 	gen.OrderStatusCONFIRMED,
 	gen.OrderStatusPAYMENTPENDING,
 	gen.OrderStatusPAID,
+	gen.OrderStatusPROCESSING,
+	gen.OrderStatusSHIPPED,
+	gen.OrderStatusDELIVERED,
+	gen.OrderStatusCANCELLED,
 }
 
 // MountOrdersWrite registers PATCH /{id}/fulfillment and POST /{id}/escalate
@@ -46,15 +55,18 @@ func MountOrdersWrite(r chi.Router, d OrdersWriteDeps) {
 }
 
 // ordersFulfillment ports OrdersService.updateFulfillment
-// (orders.service.ts:76-87): updateMany {where {id, businessId}, data
-// {status}}; count===0 -> NotFoundException('Order not found') — which is
-// also the cross-tenant answer since businessId scopes the UPDATE.
+// (orders.service.ts:77-108): findFirst({id, businessId}) -> 404 'Order not
+// found' on miss (also the cross-tenant answer), update status, and — on a
+// fresh transition into DELIVERED (not a repeat update already at
+// DELIVERED) — schedule the delivery-confirmation follow-up 2h out via the
+// same db-backed ScheduledFollowUp mechanism as order-ledger.handler.ts.
 func ordersFulfillment(q *gen.Queries) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		bizID, ok := ep_businessID(w, r)
 		if !ok {
 			return
 		}
+		id := chi.URLParam(r, "id")
 
 		var body struct {
 			Status *string `json:"status"`
@@ -73,23 +85,44 @@ func ordersFulfillment(q *gen.Queries) http.HandlerFunc {
 			httpx.WriteZodValidationError(w, []httpx.FieldIssue{{
 				Code:    "invalid_enum_value",
 				Path:    "status",
-				Message: "Invalid enum value. Expected 'PENDING' | 'CONFIRMED' | 'PAYMENT_PENDING' | 'PAID', received '" + *body.Status + "'",
+				Message: "Invalid enum value. Expected 'PENDING' | 'CONFIRMED' | 'PAYMENT_PENDING' | 'PAID' | 'PROCESSING' | 'SHIPPED' | 'DELIVERED' | 'CANCELLED', received '" + *body.Status + "'",
 			}})
 			return
 		}
 
-		affected, err := q.UpdateOrderFulfillment(r.Context(), gen.UpdateOrderFulfillmentParams{
-			Status:     status,
-			ID:         chi.URLParam(r, "id"),
-			BusinessID: bizID,
+		existing, err := q.GetOrderByIDAndBusiness(r.Context(), gen.GetOrderByIDAndBusinessParams{
+			ID: id, BusinessID: bizID,
 		})
+		if errors.Is(err, pgx.ErrNoRows) {
+			httpx.WriteError(w, r, httpx.NewHTTPException(http.StatusNotFound, "Order not found"))
+			return
+		}
 		if err != nil {
 			httpx.WriteError(w, r, err)
 			return
 		}
-		if affected == 0 {
-			httpx.WriteError(w, r, httpx.NewHTTPException(http.StatusNotFound, "Order not found"))
+
+		if _, err := q.UpdateOrderFulfillment(r.Context(), gen.UpdateOrderFulfillmentParams{
+			Status:     status,
+			ID:         id,
+			BusinessID: bizID,
+		}); err != nil {
+			httpx.WriteError(w, r, err)
 			return
+		}
+
+		if status == gen.OrderStatusDELIVERED && existing.Status != gen.OrderStatusDELIVERED {
+			if err := q.InsertScheduledFollowUp(r.Context(), gen.InsertScheduledFollowUpParams{
+				ID:          uuid.NewString(),
+				OrderID:     id,
+				BusinessID:  bizID,
+				CustomerID:  existing.CustomerID,
+				JobType:     "delivery-confirmation",
+				ScheduledAt: pgtype.Timestamp{Time: time.Now().UTC().Add(2 * time.Hour), Valid: true},
+			}); err != nil {
+				httpx.WriteError(w, r, err)
+				return
+			}
 		}
 
 		_ = httpx.WriteJSON(w, http.StatusOK, struct {

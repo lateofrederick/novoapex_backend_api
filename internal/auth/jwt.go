@@ -8,6 +8,8 @@ import (
 	"strings"
 
 	"github.com/golang-jwt/jwt/v5"
+
+	"github.com/novoapex/novoapex-backend-api/internal/errreport"
 )
 
 // Claims ports JwtPayload from apps/mobile-api/src/auth/jwt.strategy.ts:8-11
@@ -73,6 +75,7 @@ func Middleware(secret string, isPublic func(*http.Request) bool) func(http.Hand
 
 			claims, err := ParseToken(secret, jwt_bearerToken(r.Header.Get("Authorization")))
 			if err != nil {
+				errreport.Report(w, &errreport.Exception{Name: "UnauthorizedException", Status: http.StatusUnauthorized, Message: "Invalid or missing session token"})
 				jwt_unauthorized(w)
 				return
 			}

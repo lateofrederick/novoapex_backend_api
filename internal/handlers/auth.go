@@ -217,20 +217,22 @@ type verifyResponse struct {
 // camelCase keys in schema.prisma field order; no Decimal fields exist on the
 // model so DecimalSerializerInterceptor never touches these responses.
 type authBusinessJSON struct {
-	ID                     string  `json:"id"`
-	Name                   string  `json:"name"`
-	OwnerPhone             string  `json:"ownerPhone"`
-	WhatsappPhoneNumberID  string  `json:"whatsappPhoneNumberId"`
-	CreatedAt              isoTime `json:"createdAt"`
-	UpdatedAt              isoTime `json:"updatedAt"`
-	Currency               string  `json:"currency"`
-	Category               *string `json:"category"`
-	Location               *string `json:"location"`
-	AssistantEnabled       bool    `json:"assistantEnabled"`
-	ConfirmationDelayHours int32   `json:"confirmationDelayHours"`
-	PaystackRecipientCode  *string `json:"paystackRecipientCode"`
-	PaymentCallbackUrl     *string `json:"paymentCallbackUrl"`
-	TemplateLanguage       string  `json:"templateLanguage"`
+	ID                        string   `json:"id"`
+	Name                      string   `json:"name"`
+	OwnerPhone                string   `json:"ownerPhone"`
+	WhatsappPhoneNumberID     string   `json:"whatsappPhoneNumberId"`
+	CreatedAt                 isoTime  `json:"createdAt"`
+	UpdatedAt                 isoTime  `json:"updatedAt"`
+	Currency                  string   `json:"currency"`
+	Category                  *string  `json:"category"`
+	Location                  *string  `json:"location"`
+	AssistantEnabled          bool     `json:"assistantEnabled"`
+	ConfirmationDelayHours    int32    `json:"confirmationDelayHours"`
+	PaystackRecipientCode     *string  `json:"paystackRecipientCode"`
+	PaymentCallbackUrl        *string  `json:"paymentCallbackUrl"`
+	TemplateLanguage          string   `json:"templateLanguage"`
+	NewArrivalsTemplateName   *string  `json:"newArrivalsTemplateName"`
+	LastNewArrivalsNotifiedAt *isoTime `json:"lastNewArrivalsNotifiedAt"`
 }
 
 func auth_fillBusiness(dst *authBusinessJSON, b gen.Business) {
@@ -248,6 +250,8 @@ func auth_fillBusiness(dst *authBusinessJSON, b gen.Business) {
 	dst.PaystackRecipientCode = ep_text(b.PaystackRecipientCode)
 	dst.PaymentCallbackUrl = ep_text(b.PaymentCallbackUrl)
 	dst.TemplateLanguage = b.TemplateLanguage
+	dst.NewArrivalsTemplateName = ep_text(b.NewArrivalsTemplateName)
+	dst.LastNewArrivalsNotifiedAt = epISOPtr(b.LastNewArrivalsNotifiedAt)
 }
 
 // ---- GET /auth/me ----------------------------------------------------------

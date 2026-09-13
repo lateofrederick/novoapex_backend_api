@@ -1,19 +1,18 @@
 package harness
 
 import (
-	"bytes"
 	"context"
-	"errors"
 	"fmt"
+	"log/slog"
 	"net"
-	"os"
-	"os/exec"
-	"path/filepath"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	_ "github.com/jackc/pgx/v5/stdlib"
 	"github.com/testcontainers/testcontainers-go"
 	"github.com/testcontainers/testcontainers-go/wait"
+
+	"github.com/novoapex/novoapex-backend-api/internal/db"
 )
 
 const (
@@ -112,45 +111,22 @@ func (h *Harness) Terminate(ctx context.Context) {
 	}
 }
 
-func NovoApexRepoDir() (string, error) {
-	if v := os.Getenv("NOVOAPEX_REPO"); v != "" {
-		if ok, err := repoExists(v); err == nil && ok {
-			return filepath.Abs(v)
-		}
-		return "", fmt.Errorf("NOVOAPEX_REPO=%s does not contain prisma/schema.prisma", v)
-	}
-	candidates := []string{"../../../novoapex", "../../novoapex"}
-	for _, c := range candidates {
-		ok, err := repoExists(c)
-		if err == nil && ok {
-			return filepath.Abs(c)
-		}
-	}
-	return "", errors.New("novoapex repo not found; set NOVOAPEX_REPO")
-}
-
-func repoExists(dir string) (bool, error) {
-	fi, err := os.Stat(filepath.Join(dir, "prisma", "schema.prisma"))
-	if err != nil {
-		return false, err
-	}
-	return !fi.IsDir(), nil
-}
-
-func ApplyPrismaMigrations(ctx context.Context, repoDir, dsn string) error {
+// ApplyBaselineSchema brings a fresh test database to the current schema by
+// running the same embedded migrations (internal/db.Migrate) that cmd/migrate
+// applies in production. It is the schema-bootstrap mechanism for every test
+// in this repo.
+func ApplyBaselineSchema(ctx context.Context, dsn string) error {
 	cmdCtx, cancel := context.WithTimeout(ctx, 2*time.Minute)
 	defer cancel()
 
-	var out bytes.Buffer
-	cmd := exec.CommandContext(cmdCtx, "npx", "prisma", "migrate", "deploy",
-		"--schema", filepath.Join(repoDir, "prisma", "schema.prisma"))
-	cmd.Dir = repoDir
-	cmd.Env = append(os.Environ(), "DATABASE_URL="+dsn)
-	cmd.Stdout = &out
-	cmd.Stderr = &out
+	conn, err := pgx.Connect(cmdCtx, dsn)
+	if err != nil {
+		return fmt.Errorf("connect: %w", err)
+	}
+	defer func() { _ = conn.Close(cmdCtx) }()
 
-	if err := cmd.Run(); err != nil {
-		return fmt.Errorf("prisma migrate deploy: %w\n%s", err, out.String())
+	if _, err := db.Migrate(cmdCtx, conn, slog.New(slog.DiscardHandler)); err != nil {
+		return fmt.Errorf("apply migrations: %w", err)
 	}
 	return nil
 }

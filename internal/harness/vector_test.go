@@ -44,8 +44,7 @@ func seedBusinessAndProduct(t *testing.T, db *sql.DB, productID string, embeddin
 
 func TestVectorRoundTripPreservesFullPrecision(t *testing.T) {
 	h := startHarness(t)
-	repoDir := harnessRepoDir(t)
-	applyMigrations(t, h.PostgresDSN, repoDir)
+	applyBaseline(t, h.PostgresDSN)
 
 	db, err := sql.Open("pgx", h.PostgresDSN)
 	if err != nil {
@@ -70,8 +69,7 @@ func TestVectorRoundTripPreservesFullPrecision(t *testing.T) {
 
 func TestVectorDimensionIsEnforced(t *testing.T) {
 	h := startHarness(t)
-	repoDir := harnessRepoDir(t)
-	applyMigrations(t, h.PostgresDSN, repoDir)
+	applyBaseline(t, h.PostgresDSN)
 
 	db, err := sql.Open("pgx", h.PostgresDSN)
 	if err != nil {

@@ -10,7 +10,7 @@ import (
 )
 
 const getBusinessByID = `-- name: GetBusinessByID :one
-SELECT id, name, whatsapp_phone_number_id, created_at, updated_at, currency, assistant_enabled, category, confirmation_delay_hours, location, owner_phone, paystack_recipient_code, payment_callback_url, template_language FROM businesses WHERE id = $1
+SELECT id, name, whatsapp_phone_number_id, created_at, updated_at, currency, assistant_enabled, category, confirmation_delay_hours, location, owner_phone, paystack_recipient_code, payment_callback_url, template_language, new_arrivals_template_name, last_new_arrivals_notified_at FROM businesses WHERE id = $1
 `
 
 func (q *Queries) GetBusinessByID(ctx context.Context, id string) (Business, error) {
@@ -31,12 +31,14 @@ func (q *Queries) GetBusinessByID(ctx context.Context, id string) (Business, err
 		&i.PaystackRecipientCode,
 		&i.PaymentCallbackUrl,
 		&i.TemplateLanguage,
+		&i.NewArrivalsTemplateName,
+		&i.LastNewArrivalsNotifiedAt,
 	)
 	return i, err
 }
 
 const listBusinessesByOwnerPhone = `-- name: ListBusinessesByOwnerPhone :one
-SELECT id, name, whatsapp_phone_number_id, created_at, updated_at, currency, assistant_enabled, category, confirmation_delay_hours, location, owner_phone, paystack_recipient_code, payment_callback_url, template_language FROM businesses WHERE owner_phone = $1 LIMIT 1
+SELECT id, name, whatsapp_phone_number_id, created_at, updated_at, currency, assistant_enabled, category, confirmation_delay_hours, location, owner_phone, paystack_recipient_code, payment_callback_url, template_language, new_arrivals_template_name, last_new_arrivals_notified_at FROM businesses WHERE owner_phone = $1 LIMIT 1
 `
 
 func (q *Queries) ListBusinessesByOwnerPhone(ctx context.Context, ownerPhone string) (Business, error) {
@@ -57,6 +59,8 @@ func (q *Queries) ListBusinessesByOwnerPhone(ctx context.Context, ownerPhone str
 		&i.PaystackRecipientCode,
 		&i.PaymentCallbackUrl,
 		&i.TemplateLanguage,
+		&i.NewArrivalsTemplateName,
+		&i.LastNewArrivalsNotifiedAt,
 	)
 	return i, err
 }

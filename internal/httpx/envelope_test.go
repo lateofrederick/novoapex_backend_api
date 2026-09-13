@@ -150,40 +150,60 @@ type codedStatusError struct {
 func (e *codedStatusError) StatusCode() int { return e.code }
 func (e *codedStatusError) Error() string   { return e.msg }
 
-func TestWriteError_SentryHookGating(t *testing.T) {
-	var captured []error
-	SentryHook = func(r *http.Request, err error) {
-		captured = append(captured, err)
-	}
-	defer func() { SentryHook = nil }()
+// reportingRecorder stands in for the Sentry middleware's response writer.
+type reportingRecorder struct {
+	*httptest.ResponseRecorder
+	reported []error
+}
 
+func (r *reportingRecorder) ReportException(err error) { r.reported = append(r.reported, err) }
+
+// wrappedWriter is an unrelated middleware wrapper between the handler and
+// the reporter.
+type wrappedWriter struct{ http.ResponseWriter }
+
+func (w wrappedWriter) Unwrap() http.ResponseWriter { return w.ResponseWriter }
+
+func TestExceptionsReachErrorTracking(t *testing.T) {
+	boom := errors.New("boom")
 	cases := []struct {
-		url     string
-		wantNil bool
+		name     string
+		write    func(w http.ResponseWriter)
+		wantName string
+		wantErr  error
 	}{
-		{"/users", false},
-		{"/health", true},
-		{"/health/live", true},
-		{"/health/ready", true},
-		{"/healthz", false}, // prefix must match exactly or p+'/'
-		{"/health/sub", true},
+		{"handler errors (WriteError)", func(w http.ResponseWriter) {
+			WriteError(w, httptest.NewRequest("GET", "/users", nil), boom)
+		}, "", boom},
+		{"http exceptions", func(w http.ResponseWriter) {
+			WriteError(w, httptest.NewRequest("GET", "/users", nil), NewHTTPException(http.StatusNotFound, "nope"))
+		}, "", nil},
+		{"validation pipe", func(w http.ResponseWriter) {
+			WriteZodValidationError(w, []FieldIssue{{Code: "custom", Path: "x", Message: "bad"}})
+		}, "ZodValidationException", nil},
 	}
 	for _, c := range cases {
-		captured = nil
-		w := httptest.NewRecorder()
-		WriteError(w, httptest.NewRequest("GET", c.url, nil), errors.New("boom"))
-		if c.wantNil && len(captured) != 0 {
-			t.Errorf("%s: hook invoked, want skipped", c.url)
-		}
-		if !c.wantNil && len(captured) != 1 {
-			t.Errorf("%s: hook invoked %d times, want 1", c.url, len(captured))
-		}
+		t.Run(c.name, func(t *testing.T) {
+			rec := &reportingRecorder{ResponseRecorder: httptest.NewRecorder()}
+			c.write(wrappedWriter{rec})
+			if len(rec.reported) != 1 {
+				t.Fatalf("reported %d exceptions, want 1", len(rec.reported))
+			}
+			if c.wantErr != nil && !errors.Is(rec.reported[0], c.wantErr) {
+				t.Errorf("reported %v, want %v", rec.reported[0], c.wantErr)
+			}
+			if c.wantName != "" {
+				named, ok := rec.reported[0].(interface{ ExceptionName() string })
+				if !ok || named.ExceptionName() != c.wantName {
+					t.Errorf("reported %#v, want a %s", rec.reported[0], c.wantName)
+				}
+			}
+		})
 	}
 
-	// No hook wired -> never panics.
-	SentryHook = nil
+	// No error tracking wired: nothing to report to, the response is intact.
 	w := httptest.NewRecorder()
-	WriteError(w, httptest.NewRequest("GET", "/users", nil), errors.New("boom"))
+	WriteError(w, httptest.NewRequest("GET", "/users", nil), boom)
 	if w.Code != 500 {
 		t.Errorf("code = %d", w.Code)
 	}
