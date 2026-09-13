@@ -1,13 +1,7 @@
-{
-	{$DOMAIN}
-}
-
-# Queue dashboard: auth enforced by the asynqmon-auth sidecar
-# (BULL_BOARD_USER / BULL_BOARD_PASSWORD from .env).
-/admin/queues* {
-	reverse_proxy asynqmon-auth:8081
-}
-
-handle {
+# TLS is provisioned automatically for $DOMAIN. Everything — API, webhooks,
+# the /admin/queues dashboard and /api-docs — is served by go-api, which trusts
+# this single proxy hop for client IPs (X-Forwarded-For).
+{$DOMAIN} {
+	encode zstd gzip
 	reverse_proxy go-api:3100
 }

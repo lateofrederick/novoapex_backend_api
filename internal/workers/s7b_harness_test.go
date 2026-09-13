@@ -3,6 +3,7 @@ package workers_test
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"net"
 	"net/http"
@@ -69,12 +70,8 @@ func s7bStartDB(t *testing.T) *s7bDB {
 	}
 	t.Cleanup(func() { env.Terminate(context.Background()) })
 
-	repoDir, err := harness.NovoApexRepoDir()
-	if err != nil {
-		t.Skipf("novoapex repo not reachable: %v", err)
-	}
-	if err := harness.ApplyPrismaMigrations(ctx, repoDir, env.PostgresDSN); err != nil {
-		t.Fatalf("prisma migrate deploy: %v", err)
+	if err := harness.ApplyBaselineSchema(ctx, env.PostgresDSN); err != nil {
+		t.Fatalf("apply schema: %v", err)
 	}
 
 	pool, err := pgxpool.New(ctx, env.PostgresDSN)
@@ -110,7 +107,12 @@ type s7bPublisher struct {
 func (p *s7bPublisher) Enqueue(_ context.Context, q, taskType string, payload any, _ *queue.EnqueueOpts) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	m, _ := payload.(map[string]any)
+	// Decode the wire JSON, as a real consumer would see it, rather than
+	// type-asserting the producer's Go value.
+	var m map[string]any
+	if raw, err := json.Marshal(payload); err == nil {
+		_ = json.Unmarshal(raw, &m)
+	}
 	p.enqueued = append(p.enqueued, s7bEnqueuedJob{Queue: q, TaskType: taskType, Payload: m})
 	return nil
 }
