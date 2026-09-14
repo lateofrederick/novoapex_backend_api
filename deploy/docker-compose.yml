@@ -46,8 +46,8 @@ services:
       migrate:
         condition: service_completed_successfully
     environment:
-      - NODE_ENV=production
-      - PORT=3100
+      - NODE_ENV=${NODE_ENV:-production}
+      - PORT=${PORT:-3100}
       - DATABASE_URL=postgresql://postgres:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}@db:5432/novoapex?schema=public
       - DATABASE_POOL_MAX=${DATABASE_POOL_MAX:-10}
       - DATABASE_POOL_IDLE_TIMEOUT_MS=${DATABASE_POOL_IDLE_TIMEOUT_MS:-30000}
@@ -84,8 +84,9 @@ services:
       - BULL_BOARD_USER=${BULL_BOARD_USER:-}
       - BULL_BOARD_PASSWORD=${BULL_BOARD_PASSWORD:-}
       - ENABLE_SWAGGER=${ENABLE_SWAGGER:-false}
-    expose:
-      - "3100"
+    ports:
+      - "3100:3100"
+      - "3000:3000"
     # caddy waits on service_healthy, which requires a healthcheck here.
     healthcheck:
       test: ["CMD", "wget", "-qO-", "http://127.0.0.1:3100/health/live"]
