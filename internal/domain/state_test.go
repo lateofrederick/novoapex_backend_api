@@ -18,20 +18,23 @@ import (
 	harness "github.com/novoapex/novoapex-backend-api/internal/harness"
 )
 
-// s7bExpectedTransitions is the literal VALID_TRANSITIONS table from
-// libs/orchestrator/src/conversation-state.service.ts:23-30 — the oracle this
-// port must reproduce exactly.
+// s7bExpectedTransitions mirrors ValidTransitions: the verbatim TS
+// VALID_TRANSITIONS table (libs/orchestrator/src/conversation-state.service.ts:23-30)
+// plus the Go-side PAID/CANCELLED extension for the event-driven checkout
+// lifecycle. Kept here (not derived) so a drift in either direction fails loud.
 var s7bExpectedTransitions = map[ConversationState][]ConversationState{
 	StateLead:      {StateBrowsing, StateCheckout, StateSupport, StateEscalated},
 	StateBrowsing:  {StateCheckout, StateSupport, StateInvoicing, StateEscalated},
 	StateCheckout:  {StateInvoicing, StateSupport, StateEscalated},
-	StateInvoicing: {StateSupport, StateEscalated},
+	StateInvoicing: {StatePaid, StateCancelled, StateSupport, StateEscalated},
+	StatePaid:      {StateBrowsing, StateSupport, StateEscalated},
+	StateCancelled: {StateBrowsing, StateSupport, StateEscalated},
 	StateSupport:   {StateBrowsing, StateLead, StateEscalated},
 	StateEscalated: {}, // terminal
 }
 
 var allStates = []ConversationState{
-	StateLead, StateBrowsing, StateCheckout, StateInvoicing, StateSupport, StateEscalated,
+	StateLead, StateBrowsing, StateCheckout, StateInvoicing, StatePaid, StateCancelled, StateSupport, StateEscalated,
 }
 
 // TestS7b_TransitionTableMatchesSource pins the exported table against the
@@ -264,5 +267,98 @@ func TestS7b_ConcurrentSameFromExactlyOneWinner(t *testing.T) {
 	}
 	if state != string(StateInvoicing) {
 		t.Errorf("final state = %q, want INVOICING", state)
+	}
+}
+
+// TestCheckoutLifecycleTransitions drives the PAID/CANCELLED extension through
+// Transition() against a real conversations row: the legal checkout-closure
+// edges succeed, the illegal ones reject and leave state untouched.
+func TestCheckoutLifecycleTransitions(t *testing.T) {
+	env := s7bStartDB(t)
+	biz := env.factory.Business()
+
+	rows := []struct {
+		name    string
+		from    ConversationState
+		attempt ConversationState
+		wantOK  bool
+	}{
+		// Legal closure edges.
+		{"invoicing_to_paid", StateInvoicing, StatePaid, true},
+		{"invoicing_to_cancelled", StateInvoicing, StateCancelled, true},
+		{"paid_to_browsing", StatePaid, StateBrowsing, true},
+		{"cancelled_to_browsing", StateCancelled, StateBrowsing, true},
+		{"invoicing_to_support", StateInvoicing, StateSupport, true},
+		// Illegal: PAID/CANCELLED cannot re-enter checkout or invoicing.
+		{"paid_to_invoicing", StatePaid, StateInvoicing, false},
+		{"paid_to_checkout", StatePaid, StateCheckout, false},
+		{"cancelled_to_invoicing", StateCancelled, StateInvoicing, false},
+		{"cancelled_to_checkout", StateCancelled, StateCheckout, false},
+		// Illegal: earlier states cannot leap to PAID/CANCELLED.
+		{"lead_to_paid", StateLead, StatePaid, false},
+		{"browsing_to_paid", StateBrowsing, StatePaid, false},
+		{"checkout_to_paid", StateCheckout, StatePaid, false},
+		{"support_to_cancelled", StateSupport, StateCancelled, false},
+		// Illegal: terminal state never moves.
+		{"escalated_to_paid", StateEscalated, StatePaid, false},
+	}
+
+	for i, row := range rows {
+		t.Run(fmt.Sprintf("%02d_%s", i+1, row.name), func(t *testing.T) {
+			conv := env.factory.Conversation(biz.ID, fmt.Sprintf("+2337%09d", i), harness.WithState(string(row.from)))
+
+			ok, err := Transition(t.Context(), env.pool, conv.ID, row.from, row.attempt)
+			if err != nil {
+				t.Fatalf("Transition(%s -> %s): %v", row.from, row.attempt, err)
+			}
+			if ok != row.wantOK {
+				t.Fatalf("Transition(%s -> %s) ok = %v, want %v", row.from, row.attempt, ok, row.wantOK)
+			}
+
+			wantState := row.from
+			if row.wantOK {
+				wantState = row.attempt
+			}
+			var state string
+			if err := env.db.QueryRow(`SELECT state::text FROM conversations WHERE id = $1`, conv.ID).Scan(&state); err != nil {
+				t.Fatalf("read final state: %v", err)
+			}
+			if state != string(wantState) {
+				t.Errorf("final state = %q, want %q", state, wantState)
+			}
+		})
+	}
+}
+
+// TestCheckoutLifecycleStaleWriteRejected pins the CAS guard for the new
+// INVOICING -> PAID edge: a caller holding a stale `from` must lose the race
+// and leave the row where the winner put it.
+func TestCheckoutLifecycleStaleWriteRejected(t *testing.T) {
+	env := s7bStartDB(t)
+	biz := env.factory.Business()
+	conv := env.factory.Conversation(biz.ID, "+233770000042", harness.WithState(string(StateCheckout)))
+
+	// Winner moves CHECKOUT -> INVOICING.
+	if ok, err := Transition(t.Context(), env.pool, conv.ID, StateCheckout, StateInvoicing); err != nil || !ok {
+		t.Fatalf("winner CHECKOUT -> INVOICING failed: ok=%v err=%v", ok, err)
+	}
+
+	// Stale caller still believes the conversation is in CHECKOUT and tries to
+	// mark it PAID; both the transition table (CHECKOUT has no PAID edge) and
+	// the CAS `WHERE state = $from` must reject it.
+	ok, err := Transition(t.Context(), env.pool, conv.ID, StateCheckout, StatePaid)
+	if err != nil {
+		t.Fatalf("stale Transition error: %v", err)
+	}
+	if ok {
+		t.Fatalf("stale CHECKOUT -> PAID was accepted, want rejection")
+	}
+
+	var state string
+	if err := env.db.QueryRow(`SELECT state::text FROM conversations WHERE id = $1`, conv.ID).Scan(&state); err != nil {
+		t.Fatalf("read final state: %v", err)
+	}
+	if state != string(StateInvoicing) {
+		t.Errorf("final state = %q, want INVOICING (winner's write preserved)", state)
 	}
 }

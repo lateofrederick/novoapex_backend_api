@@ -20,19 +20,29 @@ const (
 	StateBrowsing  ConversationState = "BROWSING"
 	StateCheckout  ConversationState = "CHECKOUT"
 	StateInvoicing ConversationState = "INVOICING"
+	StatePaid      ConversationState = "PAID"
+	StateCancelled ConversationState = "CANCELLED"
 	StateSupport   ConversationState = "SUPPORT"
 	StateEscalated ConversationState = "ESCALATED"
 )
 
 // ValidTransitions is the explicit transition table
-// (conversation-state.service.ts:23-30). Each key maps to the set of states it
-// can transition TO; any pair not listed is illegal. ESCALATED is terminal —
-// only a human action outside this service can un-escalate a conversation.
+// (conversation-state.service.ts:23-30), extended for the event-driven
+// checkout lifecycle. Each key maps to the set of states it can transition TO;
+// any pair not listed is illegal. ESCALATED is terminal — only a human action
+// outside this service can un-escalate a conversation.
+//
+// Go-side extension (not part of the TS source): PAID and CANCELLED close the
+// checkout loop. INVOICING reaches them on payment success/failure; both reset
+// to BROWSING for an explicit reorder. Order creation remains legal only from
+// CHECKOUT, which preserves the one-order-at-a-time invariant.
 var ValidTransitions = map[ConversationState][]ConversationState{
 	StateLead:      {StateBrowsing, StateCheckout, StateSupport, StateEscalated},
 	StateBrowsing:  {StateCheckout, StateSupport, StateInvoicing, StateEscalated},
 	StateCheckout:  {StateInvoicing, StateSupport, StateEscalated},
-	StateInvoicing: {StateSupport, StateEscalated},
+	StateInvoicing: {StatePaid, StateCancelled, StateSupport, StateEscalated},
+	StatePaid:      {StateBrowsing, StateSupport, StateEscalated},
+	StateCancelled: {StateBrowsing, StateSupport, StateEscalated},
 	StateSupport:   {StateBrowsing, StateLead, StateEscalated},
 	StateEscalated: {}, // terminal
 }
