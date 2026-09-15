@@ -85,7 +85,7 @@ func (e *MalformedResponseError) Error() string {
 // responses wire shapes (request side only; reply decoding lives in openai).
 
 type llmContentPart struct {
-	Type     string `json:"type"` // input_text | input_image
+	Type     string `json:"type"` // input_text | output_text | input_image
 	Text     string `json:"text,omitempty"`
 	ImageURL string `json:"image_url,omitempty"`
 }
@@ -127,16 +127,20 @@ func buildInput(req GenerateRequest) []llmInputMessage {
 		})
 	}
 	for _, msg := range req.Messages {
+		textType := "input_text"
+		if msg.Role == "assistant" {
+			textType = "output_text"
+		}
 		parts := make([]llmContentPart, 0, len(msg.Parts))
 		for _, p := range msg.Parts {
 			if p.Type == "image" && p.ImageURL != "" {
 				parts = append(parts, llmContentPart{Type: "input_image", ImageURL: p.ImageURL})
 				continue
 			}
-			parts = append(parts, llmContentPart{Type: "input_text", Text: p.Text})
+			parts = append(parts, llmContentPart{Type: textType, Text: p.Text})
 		}
 		if len(parts) == 0 {
-			parts = append(parts, llmContentPart{Type: "input_text"})
+			parts = append(parts, llmContentPart{Type: textType})
 		}
 		input = append(input, llmInputMessage{Role: msg.Role, Content: parts})
 	}

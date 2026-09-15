@@ -183,6 +183,17 @@ func TestGenerateObjectWireFormat(t *testing.T) {
 		t.Errorf("system part wrong: %v", sysContent)
 	}
 
+	// Assistant turn must be sent as output_text (Responses API rejects
+	// input_text on an assistant message with a 400 invalid_value).
+	assistant := input[2].(map[string]any)
+	if assistant["role"] != "assistant" {
+		t.Fatalf("input[2] role = %v, want assistant", assistant["role"])
+	}
+	assistantPart := assistant["content"].([]any)[0].(map[string]any)
+	if assistantPart["type"] != "output_text" || assistantPart["text"] != "hello" {
+		t.Errorf("assistant part wrong: %v", assistantPart)
+	}
+
 	// Multimodal snapshot: image rides on the LAST user turn as input_image
 	// with the data URL verbatim, after its input_text sibling.
 	last := input[3].(map[string]any)
