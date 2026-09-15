@@ -647,13 +647,7 @@ func orchGenerateAndHandleLlmResponse(ctx context.Context, deps OrchestratorDeps
 	current := oc.state
 	newState := domain.ConversationState("")
 	hasNew := false
-	sig := resp.CrmSignals
 	switch {
-	case sig.OrderConfirmed && len(sig.DetectedItems) > 0:
-		// Order confirmed → INVOICING (from any active state) (:589-596).
-		if current != domain.StateInvoicing && current != domain.StateEscalated {
-			newState, hasNew = domain.StateInvoicing, true
-		}
 	case resp.Intent == "checkout_request": // (:597-601)
 		if current == domain.StateLead || current == domain.StateBrowsing {
 			newState, hasNew = domain.StateCheckout, true
@@ -678,11 +672,22 @@ func orchGenerateAndHandleLlmResponse(ctx context.Context, deps OrchestratorDeps
 		}
 	}
 
-	// Stealth CRM emission (:626-643) — MUST NOT block the reply; failures
-	// logged and swallowed.
+	// Stealth CRM enrichment (:626-643) — MUST NOT block the reply; failures
+	// logged and swallowed. Order creation is a separate checkout job: this
+	// signal only carries profile/name/opt-in enrichment.
 	crmJob := orchCRMSignalJob(oc, latest, resp)
 	if err := deps.Publisher.Enqueue(ctx, queue.QCRMMaterialiser, queue.TaskCRMProcess, crmJob, nil); err != nil {
 		slog.Warn("Failed to emit CRM signals (non-blocking)", "err", err)
+	}
+
+	// Checkout: when the turn confirmed an order, fan out to the checkout
+	// pipeline (order + state flip + order.created), which owns the
+	// CHECKOUT -> INVOICING transition and the one-order-at-a-time guard.
+	if resp.CrmSignals.OrderConfirmed && len(resp.CrmSignals.DetectedItems) > 0 {
+		checkoutJob := orchCheckoutJob(oc, latest, resp)
+		if err := deps.Publisher.Enqueue(ctx, queue.QCheckout, queue.TaskCheckout, checkoutJob, nil); err != nil {
+			slog.Warn("Failed to emit checkout job (non-blocking)", "err", err)
+		}
 	}
 	return nil
 }

@@ -24,7 +24,6 @@ import (
 	"github.com/novoapex/novoapex-backend-api/internal/db"
 	"github.com/novoapex/novoapex-backend-api/internal/integrations/google"
 	"github.com/novoapex/novoapex-backend-api/internal/integrations/openai"
-	"github.com/novoapex/novoapex-backend-api/internal/integrations/paystack"
 	"github.com/novoapex/novoapex-backend-api/internal/integrations/whatsapp"
 	"github.com/novoapex/novoapex-backend-api/internal/observability"
 	"github.com/novoapex/novoapex-backend-api/internal/orchestrator"
@@ -96,7 +95,6 @@ func main() {
 	openaiClient := openai.New(openai.Config{APIKey: cfg.OpenAIAPIKey, BaseURL: openaiBaseURL})
 	gemini := google.New(google.Config{APIKey: cfg.GoogleGenerativeAIAPIKey, BaseURL: os.Getenv("GOOGLE_GENERATIVE_AI_BASE_URL")})
 	wa := whatsapp.New(cfg.WhatsAppAPIVersion, cfg.WhatsAppAccessToken)
-	psc := paystack.New(paystack.Config{SecretKey: cfg.PaystackSecretKey, BaseURL: cfg.PaystackBaseURL})
 
 	// Inbound: webhook-processing persists the message and debounces the
 	// orchestrator run.
@@ -123,8 +121,11 @@ func main() {
 	// Outbound: the sole sender of WhatsApp messages.
 	workers.RegisterOutbound(server, workers.OutboundDeps{Pool: pool, WA: wa})
 
-	// Stealth CRM, payments, follow-ups, embeddings.
-	workers.RegisterCRM(server, workers.CRMDeps{Pool: pool, Publisher: client, Paystack: psInitiator{c: psc}})
+	// Checkout: order creation, split out of the CRM materialiser.
+	workers.RegisterCheckout(server, workers.CheckoutDeps{Pool: pool})
+
+	// Stealth CRM enrichment, payments, follow-ups, embeddings.
+	workers.RegisterCRM(server, workers.CRMDeps{Pool: pool})
 	deps := workers.Deps{
 		Pool:                            pool,
 		Publisher:                       client,
@@ -208,23 +209,6 @@ func redisTLS(cfg *config.Config) *tls.Config {
 		return nil
 	}
 	return queue.TLSServerConfig(cfg.RedisHost)
-}
-
-type psInitiator struct{ c *paystack.Client }
-
-func (p psInitiator) InitiatePayment(ctx context.Context, req workers.PaymentRequest) (workers.PaymentLink, error) {
-	res, err := p.c.InitiatePayment(ctx, paystack.InitiatePaymentRequest{
-		AmountMajor:   req.Amount,
-		Currency:      req.Currency,
-		CustomerPhone: req.CustomerPhone,
-		Reference:     req.Reference,
-		BusinessID:    req.BusinessID,
-		CallbackURL:   req.CallbackURL,
-	})
-	if err != nil {
-		return workers.PaymentLink{}, err
-	}
-	return workers.PaymentLink{ProviderReference: res.ProviderReference, PaymentURL: res.PaymentURL, Status: res.Status}, nil
 }
 
 // workerConcurrency reads WORKER_CONCURRENCY (asynq.Config.Concurrency);

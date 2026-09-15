@@ -3,11 +3,12 @@
 // libs/queue/src/processors/crm-materialiser.processor.ts — a deterministic,
 // LLM-free consumer that turns per-turn CRM signals into durable records.
 //
-// Flow (processor comment, crm-materialiser.processor.ts:19-23):
+// Flow (slimmed for the checkout/CRM split — order creation, payment,
+// profile-stats and follow-ups now live in checkout.go and its order.created
+// consumers, not here):
 //  1. always update profile (accumulate preferences, sentiment, delivery area)
-//  2. if order confirmed → create Order + OrderItems (+ invoice + follow-ups)
-//  3. if customer name detected → update Customer name
-//  4. if marketing opt-in/decline stated → update Customer.marketingOptIn
+//  2. if customer name detected → update Customer name
+//  3. if marketing opt-in/decline stated → update Customer.marketingOptIn
 //
 // Core logic lives in pure funcs (HandleCRMSignals and the crm* handlers in
 // crm_handlers.go) so tests exercise them directly without asynq.
@@ -20,46 +21,14 @@ import (
 	"log/slog"
 
 	"github.com/jackc/pgx/v5/pgxpool"
-	"github.com/shopspring/decimal"
 
 	"github.com/novoapex/novoapex-backend-api/internal/queue"
 )
 
-// CRMDeps carries everything the materialiser touches. Pool is the real
-// database; Publisher fans out to the outbound queue; Paystack initiates
-// checkout links. All three are interface/fake-friendly for tests.
+// CRMDeps carries everything the enrichment materialiser touches. It no longer
+// touches orders or payments — checkout owns those.
 type CRMDeps struct {
-	Pool      *pgxpool.Pool
-	Publisher queue.Publisher
-	Paystack  PaystackInitiator
-}
-
-// PaystackInitiator mirrors PaymentProvider.initiatePayment
-// (libs/common/src/payments/payment-provider.interface.ts:122) — the single
-// capability the order ledger needs from the payment factory.
-type PaystackInitiator interface {
-	InitiatePayment(ctx context.Context, req PaymentRequest) (PaymentLink, error)
-}
-
-// PaymentRequest mirrors InitiatePaymentParams
-// (payment-provider.interface.ts:45-69). Amount stays in MAJOR units here;
-// converting to provider minor units (Math.round(amount * 100)) belongs to the
-// Paystack adapter, exactly like the source.
-type PaymentRequest struct {
-	Amount        decimal.Decimal // major currency units
-	Currency      string
-	CustomerPhone string
-	Reference     string
-	CallbackURL   string
-	BusinessID    string
-}
-
-// PaymentLink mirrors InitiatePaymentResult
-// (payment-provider.interface.ts:74-83).
-type PaymentLink struct {
-	ProviderReference string
-	PaymentURL        string
-	Status            string // "initiated" | "failed"
+	Pool *pgxpool.Pool
 }
 
 // CRMSignalJob mirrors CrmSignalJobData
@@ -118,8 +87,6 @@ func HandleCRMSignals(ctx context.Context, deps CRMDeps, job CRMSignalJob) error
 		"event", "crm_materialiser_started",
 		"customerId", job.CustomerID,
 		"conversationId", job.ConversationID,
-		"orderConfirmed", job.CRMSignals.OrderConfirmed,
-		"itemCount", len(job.CRMSignals.DetectedItems),
 		"preferencesCount", len(job.CRMSignals.DetectedPreferences),
 	)
 
@@ -130,16 +97,7 @@ func HandleCRMSignals(ctx context.Context, deps CRMDeps, job CRMSignalJob) error
 		return err
 	}
 
-	// 2. If order confirmed with items, create order
-	if job.CRMSignals.OrderConfirmed && len(job.CRMSignals.DetectedItems) > 0 {
-		if err := runCRMStage("order_ledger", func() error {
-			return crmHandleOrderLedger(ctx, deps, job)
-		}); err != nil {
-			return err
-		}
-	}
-
-	// 3. If customer name detected, update it
+	// 2. If customer name detected, update it
 	if job.CRMSignals.CustomerName != nil {
 		if err := runCRMStage("customer_capture", func() error {
 			return crmHandleCustomerCapture(ctx, deps, job.CustomerID, *job.CRMSignals.CustomerName)
@@ -148,7 +106,7 @@ func HandleCRMSignals(ctx context.Context, deps CRMDeps, job CRMSignalJob) error
 		}
 	}
 
-	// 4. If marketing opt-in/decline was explicitly stated, record it
+	// 3. If marketing opt-in/decline was explicitly stated, record it
 	if job.CRMSignals.WantsUpdates != nil {
 		if err := runCRMStage("marketing_opt_in", func() error {
 			return crmHandleMarketingOptIn(ctx, deps, job.CustomerID, *job.CRMSignals.WantsUpdates)

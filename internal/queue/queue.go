@@ -13,6 +13,7 @@ const (
 	QWebhookProcessing = "webhook-processing"
 	QOrchestrator      = "orchestrator-queue"
 	QOutbound          = "outbound-queue"
+	QCheckout          = "checkout"
 	QCRMMaterialiser   = "crm-materialiser"
 	QPaymentEvents     = "payment-events"
 	QFollowUp          = "follow-up"
@@ -23,7 +24,7 @@ const (
 // AllQueues lists every queue the system declares (QueueProducerModule's
 // registerQueue list), so dashboards show them before their first job.
 func AllQueues() []string {
-	return []string{QExample, QOrchestrator, QOutbound, QWebhookProcessing, QCRMMaterialiser, QPaymentEvents, QFollowUp, QEmbedding}
+	return []string{QExample, QOrchestrator, QOutbound, QCheckout, QWebhookProcessing, QCRMMaterialiser, QPaymentEvents, QFollowUp, QEmbedding}
 }
 
 // Task types — mirror the Node job name for every enqueue site.
@@ -31,6 +32,7 @@ const (
 	TaskWebhookProcess       = "webhook-processing:process"
 	TaskOrchestratorDebounce = "orchestrator-queue:debounced"
 	TaskOutboundSend         = "outbound-queue:send-message"
+	TaskCheckout             = "checkout:create-order"
 	TaskCRMProcess           = "crm-materialiser:process-crm-signals"
 	TaskPaymentProcess       = "payment-events:process"
 	TaskEmbedProduct         = "embedding:embed-product"
