@@ -6,30 +6,24 @@ import (
 	"testing"
 	"time"
 
-	"github.com/shopspring/decimal"
-
 	harness "github.com/novoapex/novoapex-backend-api/internal/harness"
 	"github.com/novoapex/novoapex-backend-api/internal/workers"
 )
 
-// TestS7b_InsufficientStockRollbackZeroRows ports TestT007c's materialiser
-// core: ZERO order rows, stock intact, nil error (warn + swallow).
+// TestS7b_InsufficientStockRollbackZeroRows ports TestT007c's checkout core:
+// ZERO order rows, stock intact, nil error (warn + swallow).
 func TestS7b_InsufficientStockRollbackZeroRows(t *testing.T) {
 	env = s7bNewEnv(t)
 
 	biz := env.dbw.factory.Business()
 	prod := env.dbw.factory.Product(biz.ID, harness.WithStock(1), harness.WithPrice("30.00"))
 	cust := env.dbw.factory.Customer(biz.ID)
-	conv := env.dbw.factory.Conversation(biz.ID, cust.Phone, harness.WithLinkedCustomer(cust.ID))
+	conv := env.dbw.factory.Conversation(biz.ID, cust.Phone,
+		harness.WithLinkedCustomer(cust.ID), harness.WithState("CHECKOUT"))
 	shortID := prod.ID[:8]
 
-	job := s7bBaseJob(biz.ID, cust.ID, conv.ID, cust.Phone, "wamid.s7b-short")
-	job.CRMSignals.OrderConfirmed = true
-	job.CRMSignals.DetectedItems = []workers.DetectedItem{{ProductID: shortID, Quantity: 5}}
-
-	if err := workers.HandleCRMSignals(ctx(), env.deps, job); err != nil {
-		t.Fatalf("insufficient stock must be swallowed (job completes), got error: %v", err)
-	}
+	s7bRunCheckout(t, s7bCheckoutJob(biz.ID, cust.ID, conv.ID, cust.Phone, "wamid.s7b-short",
+		[]workers.DetectedItem{{ProductID: shortID, Quantity: 5}}))
 
 	if got := s7bScalarInt(t, `SELECT COUNT(*) FROM orders WHERE conversation_id = $1`, conv.ID); got != 0 {
 		t.Errorf("orders = %d, want 0 (transaction rolled back)", got)
@@ -41,21 +35,21 @@ func TestS7b_InsufficientStockRollbackZeroRows(t *testing.T) {
 	if stock := s7bScalarString(t, `SELECT stock::text FROM products WHERE id = $1`, prod.ID); stock != "1" {
 		t.Errorf("stock = %s, want intact 1", stock)
 	}
-	if got := s7bScalarInt(t,
-		`SELECT COUNT(*) FROM scheduled_follow_ups sfu JOIN orders o ON o.id = sfu.order_id WHERE o.conversation_id = $1`, conv.ID); got != 0 {
-		t.Errorf("follow-ups scheduled after rollback = %d, want 0", got)
+	if state := s7bScalarString(t, `SELECT state::text FROM conversations WHERE id = $1`, conv.ID); state != "CHECKOUT" {
+		t.Errorf("state = %s, want CHECKOUT (rollback leaves the order slot unclaimed)", state)
 	}
 }
 
 // TestS7b_DuplicateSourceMessageIdSkipped ports TestT008's unique-index
-// backstop through the handler: a repeated sourceMessageId is a warn+return.
+// backstop through checkout: a repeated sourceMessageId is a warn+skip.
 func TestS7b_DuplicateSourceMessageIdSkipped(t *testing.T) {
 	env = s7bNewEnv(t)
 
 	biz := env.dbw.factory.Business()
 	prod := env.dbw.factory.Product(biz.ID, harness.WithStock(5), harness.WithPrice("25.50"))
 	cust := env.dbw.factory.Customer(biz.ID)
-	conv := env.dbw.factory.Conversation(biz.ID, cust.Phone, harness.WithLinkedCustomer(cust.ID))
+	conv := env.dbw.factory.Conversation(biz.ID, cust.Phone,
+		harness.WithLinkedCustomer(cust.ID), harness.WithState("CHECKOUT"))
 	shortID := prod.ID[:8]
 
 	s7bExec(t, `INSERT INTO orders
@@ -63,13 +57,8 @@ func TestS7b_DuplicateSourceMessageIdSkipped(t *testing.T) {
 		VALUES ('ord_s7b_dup', $1, $2, 'PENDING', 10.00, 'GHS', 'wamid.s7b-repeat', NOW())`,
 		biz.ID, cust.ID)
 
-	job := s7bBaseJob(biz.ID, cust.ID, conv.ID, cust.Phone, "wamid.s7b-repeat")
-	job.CRMSignals.OrderConfirmed = true
-	job.CRMSignals.DetectedItems = []workers.DetectedItem{{ProductID: shortID, Quantity: 2}}
-
-	if err := workers.HandleCRMSignals(ctx(), env.deps, job); err != nil {
-		t.Fatalf("duplicate sourceMessageId must skip (warn+nil), got error: %v", err)
-	}
+	s7bRunCheckout(t, s7bCheckoutJob(biz.ID, cust.ID, conv.ID, cust.Phone, "wamid.s7b-repeat",
+		[]workers.DetectedItem{{ProductID: shortID, Quantity: 2}}))
 
 	got := s7bScalarInt(t, `SELECT COUNT(*) FROM orders WHERE idempotency_key = 'wamid.s7b-repeat'`)
 	if got != 1 {
@@ -77,16 +66,6 @@ func TestS7b_DuplicateSourceMessageIdSkipped(t *testing.T) {
 	}
 	if stock := s7bScalarString(t, `SELECT stock::text FROM products WHERE id = $1`, prod.ID); stock != "5" {
 		t.Errorf("stock = %s, want untouched 5", stock)
-	}
-	if stats := s7bScalarInt(t, `SELECT total_orders FROM customer_profiles WHERE customer_id = $1`, cust.ID); stats != 0 {
-		t.Errorf("total_orders = %d, want 0 (skip happens before profile stats)", stats)
-	}
-	if got := s7bScalarInt(t, `SELECT COUNT(*) FROM outbound_messages WHERE conversation_id = $1`, conv.ID); got != 0 {
-		t.Errorf("outbound messages = %d, want 0 (no invoice on duplicate)", got)
-	}
-	if got := s7bScalarInt(t,
-		`SELECT COUNT(*) FROM scheduled_follow_ups sfu JOIN orders o ON o.id = sfu.order_id WHERE o.conversation_id = $1`, conv.ID); got != 0 {
-		t.Errorf("follow-ups = %d, want 0 (no scheduling on duplicate)", got)
 	}
 }
 
@@ -262,50 +241,9 @@ func TestS7b_CustomerNameUpdate(t *testing.T) {
 	}
 }
 
-// TestS7b_FollowUpOffsetsPrecision pins ScheduledFollowUp.createMany offsets:
-// abandoned-cart at +2h, unpaid-invoice-first at +24h (order-ledger.handler.ts:352, :359).
-func TestS7b_FollowUpOffsetsPrecision(t *testing.T) {
-	env = s7bNewEnv(t)
-
-	biz := env.dbw.factory.Business()
-	prod := env.dbw.factory.Product(biz.ID, harness.WithStock(5), harness.WithPrice("10.00"))
-	cust := env.dbw.factory.Customer(biz.ID)
-	conv := env.dbw.factory.Conversation(biz.ID, cust.Phone, harness.WithLinkedCustomer(cust.ID))
-
-	job := s7bBaseJob(biz.ID, cust.ID, conv.ID, cust.Phone, "wamid.s7b-fu")
-	job.CRMSignals.OrderConfirmed = true
-	job.CRMSignals.DetectedItems = []workers.DetectedItem{{ProductID: prod.ID[:8], Quantity: 1}}
-
-	started := time.Now().UTC().Add(-5 * time.Second)
-	finished := time.Now().UTC().Add(5 * time.Second)
-	if err := workers.HandleCRMSignals(ctx(), env.deps, job); err != nil {
-		t.Fatalf("handle: %v", err)
-	}
-	orderID := s7bScalarString(t, `SELECT id FROM orders WHERE conversation_id = $1`, conv.ID)
-
-	assertOffset := func(jobType string, offset time.Duration) {
-		t.Helper()
-		var scheduled time.Time
-		if err := env.dbw.db.QueryRow(
-			`SELECT scheduled_at FROM scheduled_follow_ups WHERE order_id = $1 AND job_type = $2`,
-			orderID, jobType).Scan(&scheduled); err != nil {
-			t.Fatalf("follow-up %s missing: %v", jobType, err)
-		}
-		low := started.Add(offset).Add(-time.Minute)
-		high := finished.Add(offset).Add(time.Minute)
-		if scheduled.Before(low) || scheduled.After(high) {
-			t.Errorf("%s scheduled_at = %s, want ~now+%s (window %s..%s)",
-				jobType, scheduled.Format(time.RFC3339), offset, low.Format(time.RFC3339), high.Format(time.RFC3339))
-		}
-	}
-	assertOffset("abandoned-cart", 2*time.Hour)
-	assertOffset("unpaid-invoice-first", 24*time.Hour)
-}
-
-// TestS7b_PaymentCopyPerCurrencyAndBrandFree checks getCurrencyConfig-driven
-// invoice copy: market-specific methods list, GHS fallback for unknown codes,
-// and never the provider brand in prose (currency.config.ts:6-16).
-func TestS7b_PaymentCopyPerCurrencyAndBrandFree(t *testing.T) {
+// TestS7b_CurrencyConfig pins the currency display config (currency.config.ts),
+// used by the invoice copy path. Brand names never appear in prose.
+func TestS7b_CurrencyConfig(t *testing.T) {
 	if got := workers.GetCurrencyConfig("GHS").PaymentMethods; got != "Mobile Money, card, or bank transfer" {
 		t.Errorf("GHS methods = %q, want verbatim characterization copy", got)
 	}
@@ -320,78 +258,6 @@ func TestS7b_PaymentCopyPerCurrencyAndBrandFree(t *testing.T) {
 	}
 	if got := workers.GetCurrencyConfig("").Symbol; got != "GH₵" {
 		t.Errorf("empty-currency symbol = %q, want GH₵ fallback", got)
-	}
-
-	// DB-driven prose check on an NGN order.
-	env = s7bNewEnv(t)
-	biz := env.dbw.factory.Business()
-	s7bExec(t, `UPDATE businesses SET currency = 'NGN' WHERE id = $1`, biz.ID)
-	prod := env.dbw.factory.Product(biz.ID, harness.WithStock(5), harness.WithPrice("40.00"))
-	cust := env.dbw.factory.Customer(biz.ID)
-	conv := env.dbw.factory.Conversation(biz.ID, cust.Phone, harness.WithLinkedCustomer(cust.ID))
-
-	job := s7bBaseJob(biz.ID, cust.ID, conv.ID, cust.Phone, "wamid.s7b-ngn")
-	job.CRMSignals.OrderConfirmed = true
-	job.CRMSignals.DetectedItems = []workers.DetectedItem{{ProductID: prod.ID[:8], Quantity: 1}}
-	if err := workers.HandleCRMSignals(ctx(), env.deps, job); err != nil {
-		t.Fatalf("handle NGN order: %v", err)
-	}
-
-	text := s7bScalarString(t,
-		`SELECT text_content FROM outbound_messages WHERE conversation_id = $1 ORDER BY created_at DESC LIMIT 1`,
-		conv.ID)
-	urlIdx := strings.Index(text, "https://checkout.paystack.test")
-	if urlIdx < 0 {
-		t.Fatalf("invoice text missing payment URL:\n%s", text)
-	}
-	prose := text[:urlIdx]
-	if !strings.Contains(text, "*NGN 40.00*") {
-		t.Errorf("invoice total copy missing *NGN 40.00*:\n%s", text)
-	}
-	if !strings.Contains(prose, "card, bank transfer, or USSD") {
-		t.Errorf("prose missing NGN payment methods:\n%s", prose)
-	}
-	if strings.Contains(strings.ToLower(prose), "paystack") {
-		t.Errorf("brand name leaked into invoice prose:\n%s", prose)
-	}
-	if !strings.HasPrefix(text, "Thank you for confirming your order!") {
-		t.Errorf("paymentText template prefix drifted:\n%s", text)
-	}
-}
-
-// TestS7b_PaystackFailureLeavesOrderIntact: initiatePayment failure means NO
-// invoice message but the order itself stays CONFIRMED (order-ledger.handler.ts:261-267).
-func TestS7b_PaystackFailureLeavesOrderIntact(t *testing.T) {
-	env = s7bNewEnv(t)
-	env.paystack.fail = true
-
-	biz := env.dbw.factory.Business()
-	prod := env.dbw.factory.Product(biz.ID, harness.WithStock(5), harness.WithPrice("25.50"))
-	cust := env.dbw.factory.Customer(biz.ID)
-	conv := env.dbw.factory.Conversation(biz.ID, cust.Phone, harness.WithLinkedCustomer(cust.ID))
-
-	job := s7bBaseJob(biz.ID, cust.ID, conv.ID, cust.Phone, "wamid.s7b-payfail")
-	job.CRMSignals.OrderConfirmed = true
-	job.CRMSignals.DetectedItems = []workers.DetectedItem{{ProductID: prod.ID[:8], Quantity: 1}}
-	if err := workers.HandleCRMSignals(ctx(), env.deps, job); err != nil {
-		t.Fatalf("paystack failure must not fail the job: %v", err)
-	}
-
-	if got := s7bScalarInt(t, `SELECT COUNT(*) FROM orders WHERE conversation_id = $1`, conv.ID); got != 1 {
-		t.Errorf("orders = %d, want 1 despite failed payment initiation", got)
-	}
-	if got := s7bScalarInt(t, `SELECT COUNT(*) FROM outbound_messages WHERE conversation_id = $1`, conv.ID); got != 0 {
-		t.Errorf("outbound messages = %d, want 0 when payment URL is empty", got)
-	}
-	if state := s7bScalarString(t, `SELECT state::text FROM conversations WHERE id = $1`, conv.ID); state == "INVOICING" {
-		t.Error("conversation must not reach INVOICING without a payment link")
-	}
-	if amount := s7bScalarString(t,
-		`SELECT total_amount::text FROM orders WHERE conversation_id = $1`, conv.ID); amount != "25.50" {
-		t.Errorf("total = %s, want 25.50", amount)
-	}
-	if !decimalRequireEqual(env.paystack.snapshot()[0].Amount, decimal.RequireFromString("25.50")) {
-		t.Errorf("paystack amount = %s, want 25.50", env.paystack.snapshot()[0].Amount.String())
 	}
 }
 
@@ -412,8 +278,4 @@ func mustJSON(t *testing.T, v any) string {
 		t.Fatalf("marshal fixture json: %v", err)
 	}
 	return string(b)
-}
-
-func decimalRequireEqual(a decimal.Decimal, b decimal.Decimal) bool {
-	return a.Equal(b)
 }

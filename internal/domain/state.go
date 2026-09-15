@@ -8,6 +8,8 @@ import (
 	"context"
 	"fmt"
 
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -71,11 +73,56 @@ func ValidateTransition(from, to ConversationState) bool {
 // the identical signal here. updated_at is bumped because Prisma's @updatedAt
 // fires on updateMany too.
 func Transition(ctx context.Context, pool *pgxpool.Pool, conversationID string, from, to ConversationState) (bool, error) {
+	return transition(ctx, pool, conversationID, from, to)
+}
+
+// TransitionTx is Transition scoped to an open transaction, so the state flip
+// is atomic with whatever write it guards (e.g. order creation). Returns the
+// same (ok, error) contract; a false return is a rejection, never an error.
+func TransitionTx(ctx context.Context, tx pgx.Tx, conversationID string, from, to ConversationState) (bool, error) {
+	return transition(ctx, tx, conversationID, from, to)
+}
+
+// TransitionToTx flips a conversation to `to` from ANY state in `froms`,
+// atomically inside tx. Every from->to pair must be legal; the single UPDATE
+// admits whichever source currently holds. Returns false when the conversation
+// sits in none of `froms` (a rejection, never an error). This is the guard for
+// writers that may legally run from more than one state (e.g. checkout may
+// confirm an order from BROWSING or CHECKOUT).
+func TransitionToTx(ctx context.Context, tx pgx.Tx, conversationID string, froms []ConversationState, to ConversationState) (bool, error) {
+	if len(froms) == 0 {
+		return false, nil
+	}
+	for _, from := range froms {
+		if !ValidateTransition(from, to) {
+			return false, nil
+		}
+	}
+	strs := make([]string, len(froms))
+	for i, f := range froms {
+		strs[i] = string(f)
+	}
+	tag, err := tx.Exec(ctx,
+		`UPDATE conversations SET state = $1, updated_at = CURRENT_TIMESTAMP
+		 WHERE id = $2 AND state::text = ANY($3)`,
+		string(to), conversationID, strs)
+	if err != nil {
+		return false, fmt.Errorf("domain: transition to %s for conversation %s: %w", to, conversationID, err)
+	}
+	return tag.RowsAffected() == 1, nil
+}
+
+// execer is satisfied by *pgxpool.Pool, *pgx.Conn and pgx.Tx.
+type execer interface {
+	Exec(ctx context.Context, sql string, args ...any) (pgconn.CommandTag, error)
+}
+
+func transition(ctx context.Context, db execer, conversationID string, from, to ConversationState) (bool, error) {
 	if !ValidateTransition(from, to) {
 		return false, nil
 	}
 
-	tag, err := pool.Exec(ctx,
+	tag, err := db.Exec(ctx,
 		`UPDATE conversations SET state = $1, updated_at = CURRENT_TIMESTAMP
 		 WHERE id = $2 AND state = $3`,
 		string(to), conversationID, string(from))
