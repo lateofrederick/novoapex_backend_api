@@ -34,6 +34,7 @@ const (
 	TaskOrchestratorDebounce = "orchestrator-queue:debounced"
 	TaskOutboundSend         = "outbound-queue:send-message"
 	TaskCheckout             = "checkout:create-order"
+	TaskRestock              = "checkout:restock"
 	TaskPaymentInit          = "payment-init:initiate"
 	TaskCRMProcess           = "crm-materialiser:process-crm-signals"
 	TaskProfileStats         = "crm-materialiser:profile-stats"

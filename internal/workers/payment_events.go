@@ -350,7 +350,7 @@ func paymentStatusFor(normalisedStatus string) string {
 // treated as paid, matching the reconciliation's amount-match contract.
 func settleReconciledOrder(ctx context.Context, pool *pgxpool.Pool, evt paystack.NormalisedPaymentEvent, orderID string, now time.Time) error {
 	if evt.Status == "failed" {
-		return cancelFailedOrder(ctx, pool, orderID, now)
+		return cancelOrder(ctx, pool, orderID, "payment_failed", now)
 	}
 	if _, err := pool.Exec(ctx,
 		`UPDATE orders SET status = 'PAID', updated_at = $2 WHERE id = $1`, orderID, now); err != nil {
@@ -359,19 +359,20 @@ func settleReconciledOrder(ctx context.Context, pool *pgxpool.Pool, evt paystack
 	return transitionOrderConversation(ctx, pool, orderID, domain.StateInvoicing, domain.StatePaid)
 }
 
-// cancelFailedOrder marks the order CANCELLED (unless already paid), closes the
-// conversation and emits order.cancelled — all in one transaction so the event
-// can never exist without its state change.
-func cancelFailedOrder(ctx context.Context, pool *pgxpool.Pool, orderID string, now time.Time) error {
+// cancelOrder marks the order CANCELLED (unless already paid), closes the
+// conversation INVOICING -> CANCELLED and emits order.cancelled — all in one
+// transaction so the event can never exist without its state change. Shared by
+// the failed-payment path and the checkout-expiry scanner.
+func cancelOrder(ctx context.Context, pool *pgxpool.Pool, orderID, reason string, now time.Time) error {
 	return pgx.BeginFunc(ctx, pool, func(tx pgx.Tx) error {
 		tag, err := tx.Exec(ctx,
 			`UPDATE orders SET status = 'CANCELLED', updated_at = $2
-			  WHERE id = $1 AND status <> 'PAID'`, orderID, now)
+			  WHERE id = $1 AND status IN ('CONFIRMED', 'PAYMENT_PENDING')`, orderID, now)
 		if err != nil {
 			return err
 		}
 		if tag.RowsAffected() == 0 {
-			return nil // already paid (out-of-order webhook) or missing
+			return nil // already paid / cancelled / missing
 		}
 
 		var convID string
@@ -389,7 +390,7 @@ func cancelFailedOrder(ctx context.Context, pool *pgxpool.Pool, orderID string, 
 			AggregateType: events.AggregateTypeOrder,
 			AggregateID:   orderID,
 			Type:          events.TypeOrderCancelled,
-			Payload:       events.OrderCancelled{OrderID: orderID, Reason: "payment_failed"},
+			Payload:       events.OrderCancelled{OrderID: orderID, Reason: reason},
 		})
 		return err
 	})

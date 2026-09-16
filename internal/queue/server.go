@@ -49,6 +49,7 @@ var builtinPolicies = map[string]QueuePolicy{
 	QWebhookProcessing: {MaxRetry: 2, BackoffBase: 1 * time.Second, RateLimit: 100, RateWindow: 10 * time.Second},
 	QOrchestrator:      {MaxRetry: 0},
 	QOutbound:          {MaxRetry: 2, BackoffBase: 2 * time.Second, RateLimit: 50, RateWindow: 1 * time.Second},
+	QCheckout:          {MaxRetry: 2, BackoffBase: 2 * time.Second, RateLimit: 50, RateWindow: 1 * time.Second},
 	QCRMMaterialiser:   {MaxRetry: 2, BackoffBase: 2 * time.Second, RateLimit: 50, RateWindow: 1 * time.Second},
 	QPaymentInit:       {MaxRetry: 2, BackoffBase: 2 * time.Second, RateLimit: 20, RateWindow: 1 * time.Second},
 	QPaymentEvents:     {MaxRetry: 4, BackoffBase: 3 * time.Second, RateLimit: 20, RateWindow: 1 * time.Second},

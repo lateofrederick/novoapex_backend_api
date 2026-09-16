@@ -369,6 +369,7 @@ type Order struct {
 	LocationID      pgtype.Text      `json:"location_id"`
 	PaymentUrl      pgtype.Text      `json:"payment_url"`
 	StatsRecordedAt pgtype.Timestamp `json:"stats_recorded_at"`
+	StockRestoredAt pgtype.Timestamp `json:"stock_restored_at"`
 }
 
 type OrderItem struct {

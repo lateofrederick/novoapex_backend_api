@@ -132,6 +132,9 @@ func main() {
 	workers.RegisterProfileStats(server, workers.ProfileStatsDeps{Pool: pool})
 	workers.RegisterFollowUpSchedule(server, workers.FollowUpScheduleDeps{Pool: pool})
 
+	// order.cancelled consumers: stock reversal.
+	workers.RegisterRestock(server, workers.RestockDeps{Pool: pool})
+
 	// Stealth CRM enrichment, payments, follow-ups, embeddings.
 	workers.RegisterCRM(server, workers.CRMDeps{Pool: pool})
 	deps := workers.Deps{
@@ -198,6 +201,9 @@ func main() {
 				{Queue: queue.QCRMMaterialiser, TaskType: queue.TaskProfileStats},
 				{Queue: queue.QFollowUp, TaskType: queue.TaskFollowUpSchedule},
 			},
+			events.TypeOrderCancelled: {
+				{Queue: queue.QCheckout, TaskType: queue.TaskRestock},
+			},
 		},
 	}
 	go func() {
@@ -223,6 +229,8 @@ func cronHandler(spec string, deps workers.Deps) queue.Handler {
 			return workers.SweepOutbox(ctx, deps)
 		case "retention-scanner":
 			return workers.SweepRetention(ctx, deps)
+		case "checkout-expiry":
+			return workers.SweepCheckoutExpiry(ctx, deps)
 		case "new-arrivals-scanner":
 			return workers.SweepNewArrivals(ctx, deps)
 		default:

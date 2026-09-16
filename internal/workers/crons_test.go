@@ -13,12 +13,13 @@ import (
 	"github.com/novoapex/novoapex-backend-api/internal/queue"
 )
 
-func TestS7A_CronSpecs_FourSingletonCrons(t *testing.T) {
+func TestS7A_CronSpecs_FiveSingletonCrons(t *testing.T) {
 	specs := CronSpecs()
 	want := []struct{ spec, cron string }{
 		{"follow-up-scanner", "*/1 * * * *"},
 		{"outbox-sweep", "*/2 * * * *"},
 		{"retention-scanner", "0 9 * * *"},
+		{"checkout-expiry", "*/10 * * * *"},
 		{"new-arrivals-scanner", "0 8 * * *"},
 	}
 	if len(specs) != len(want) {
