@@ -26,14 +26,19 @@ const (
 // events. Consumers key their idempotency on AggregateID + Type.
 const AggregateTypeOrder = "order"
 
+// ChannelName is the Postgres NOTIFY channel producers signal on commit, so the
+// dispatcher wakes immediately instead of waiting for the poll backstop.
+const ChannelName = "domain_event"
+
 // OrderCreated is the self-contained payload of an order.created event, so
 // subscribers never have to query the producer for what they need.
 type OrderCreated struct {
-	OrderID     string `json:"orderId"`
-	BusinessID  string `json:"businessId"`
-	CustomerID  string `json:"customerId"`
-	TotalAmount string `json:"totalAmount"` // exact decimal string, no float
-	Currency    string `json:"currency"`
+	OrderID        string `json:"orderId"`
+	BusinessID     string `json:"businessId"`
+	CustomerID     string `json:"customerId"`
+	ConversationID string `json:"conversationId"`
+	TotalAmount    string `json:"totalAmount"` // exact decimal string, no float
+	Currency       string `json:"currency"`
 }
 
 // OrderCancelled is the self-contained payload of an order.cancelled event.
@@ -51,10 +56,10 @@ type Event struct {
 	Payload       any
 }
 
-// Insert writes one event inside tx. Emission is idempotent via the unique
-// (aggregate_type, aggregate_id, event_type) index: a conflicting insert
-// returns false instead of erroring, which callers may treat as already
-// emitted.
+// Insert writes one event inside tx and signals the dispatcher via NOTIFY on
+// commit. Emission is idempotent via the unique (aggregate_type, aggregate_id,
+// event_type) index: a conflicting insert returns false instead of erroring,
+// which callers may treat as already emitted.
 func Insert(ctx context.Context, tx pgx.Tx, e Event) (bool, error) {
 	payload, err := json.Marshal(e.Payload)
 	if err != nil {
@@ -68,5 +73,13 @@ func Insert(ctx context.Context, tx pgx.Tx, e Event) (bool, error) {
 	if err != nil {
 		return false, fmt.Errorf("events: insert %s for %s/%s: %w", e.Type, e.AggregateType, e.AggregateID, err)
 	}
-	return tag.RowsAffected() == 1, nil
+	if tag.RowsAffected() == 0 {
+		return false, nil
+	}
+	// Fire on commit: the notification reaches the dispatcher only once the
+	// event's transaction is durable, so it never observes a phantom row.
+	if _, err := tx.Exec(ctx, `SELECT pg_notify($1, $2)`, ChannelName, e.AggregateID); err != nil {
+		return false, fmt.Errorf("events: notify %s for %s/%s: %w", e.Type, e.AggregateType, e.AggregateID, err)
+	}
+	return true, nil
 }

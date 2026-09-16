@@ -197,11 +197,12 @@ func HandleCheckout(ctx context.Context, deps CheckoutDeps, job CheckoutJob) err
 			AggregateID:   orderID,
 			Type:          events.TypeOrderCreated,
 			Payload: events.OrderCreated{
-				OrderID:     orderID,
-				BusinessID:  job.BusinessID,
-				CustomerID:  job.CustomerID,
-				TotalAmount: totalAmount.String(),
-				Currency:    orderCurrency,
+				OrderID:        orderID,
+				BusinessID:     job.BusinessID,
+				CustomerID:     job.CustomerID,
+				ConversationID: job.ConversationID,
+				TotalAmount:    totalAmount.String(),
+				Currency:       orderCurrency,
 			},
 		}); eerr != nil {
 			return eerr

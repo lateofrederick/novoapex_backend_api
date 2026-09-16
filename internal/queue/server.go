@@ -50,6 +50,7 @@ var builtinPolicies = map[string]QueuePolicy{
 	QOrchestrator:      {MaxRetry: 0},
 	QOutbound:          {MaxRetry: 2, BackoffBase: 2 * time.Second, RateLimit: 50, RateWindow: 1 * time.Second},
 	QCRMMaterialiser:   {MaxRetry: 2, BackoffBase: 2 * time.Second, RateLimit: 50, RateWindow: 1 * time.Second},
+	QPaymentInit:       {MaxRetry: 2, BackoffBase: 2 * time.Second, RateLimit: 20, RateWindow: 1 * time.Second},
 	QPaymentEvents:     {MaxRetry: 4, BackoffBase: 3 * time.Second, RateLimit: 20, RateWindow: 1 * time.Second},
 	QFollowUp:          {MaxRetry: 2, BackoffBase: 5 * time.Second, RateLimit: 10, RateWindow: 1 * time.Second},
 	QEmbedding:         {MaxRetry: 2, BackoffBase: 2 * time.Second},
