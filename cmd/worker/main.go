@@ -22,8 +22,10 @@ import (
 
 	"github.com/novoapex/novoapex-backend-api/internal/config"
 	"github.com/novoapex/novoapex-backend-api/internal/db"
+	"github.com/novoapex/novoapex-backend-api/internal/events"
 	"github.com/novoapex/novoapex-backend-api/internal/integrations/google"
 	"github.com/novoapex/novoapex-backend-api/internal/integrations/openai"
+	"github.com/novoapex/novoapex-backend-api/internal/integrations/paystack"
 	"github.com/novoapex/novoapex-backend-api/internal/integrations/whatsapp"
 	"github.com/novoapex/novoapex-backend-api/internal/observability"
 	"github.com/novoapex/novoapex-backend-api/internal/orchestrator"
@@ -95,6 +97,7 @@ func main() {
 	openaiClient := openai.New(openai.Config{APIKey: cfg.OpenAIAPIKey, BaseURL: openaiBaseURL})
 	gemini := google.New(google.Config{APIKey: cfg.GoogleGenerativeAIAPIKey, BaseURL: os.Getenv("GOOGLE_GENERATIVE_AI_BASE_URL")})
 	wa := whatsapp.New(cfg.WhatsAppAPIVersion, cfg.WhatsAppAccessToken)
+	psc := paystack.New(paystack.Config{SecretKey: cfg.PaystackSecretKey, BaseURL: cfg.PaystackBaseURL})
 
 	// Inbound: webhook-processing persists the message and debounces the
 	// orchestrator run.
@@ -123,6 +126,11 @@ func main() {
 
 	// Checkout: order creation, split out of the CRM materialiser.
 	workers.RegisterCheckout(server, workers.CheckoutDeps{Pool: pool})
+
+	// order.created consumers: payment initiation, profile stats, follow-ups.
+	workers.RegisterPaymentInit(server, workers.PaymentInitDeps{Pool: pool, Publisher: client, Paystack: psInitiator{c: psc}})
+	workers.RegisterProfileStats(server, workers.ProfileStatsDeps{Pool: pool})
+	workers.RegisterFollowUpSchedule(server, workers.FollowUpScheduleDeps{Pool: pool})
 
 	// Stealth CRM enrichment, payments, follow-ups, embeddings.
 	workers.RegisterCRM(server, workers.CRMDeps{Pool: pool})
@@ -179,6 +187,25 @@ func main() {
 	logger.Info("Worker process started — processing queues and cron sweeps",
 		slog.Int("concurrency", workerConcurrency()))
 
+	// Event dispatcher: publish PENDING domain_events (order.created etc.) to
+	// their queue subscribers via LISTEN/NOTIFY + a poll backstop.
+	dispatcher := &events.Dispatcher{
+		Pool:      pool,
+		Publisher: client,
+		Subscriptions: map[string][]events.Subscription{
+			events.TypeOrderCreated: {
+				{Queue: queue.QPaymentInit, TaskType: queue.TaskPaymentInit},
+				{Queue: queue.QCRMMaterialiser, TaskType: queue.TaskProfileStats},
+				{Queue: queue.QFollowUp, TaskType: queue.TaskFollowUpSchedule},
+			},
+		},
+	}
+	go func() {
+		if err := dispatcher.Run(ctx); err != nil && ctx.Err() == nil {
+			logger.Error("event dispatcher exited", slog.Any("error", err))
+		}
+	}()
+
 	<-ctx.Done()
 	logger.Info("worker shutting down")
 	sched.Shutdown()
@@ -229,3 +256,21 @@ func (l schedulerLogger) Info(args ...any)  { l.log.Info(fmt.Sprint(args...)) }
 func (l schedulerLogger) Warn(args ...any)  { l.log.Warn(fmt.Sprint(args...)) }
 func (l schedulerLogger) Error(args ...any) { l.log.Error(fmt.Sprint(args...)) }
 func (l schedulerLogger) Fatal(args ...any) { l.log.Error("fatal: " + fmt.Sprint(args...)) }
+
+// psInitiator adapts the Paystack client to workers.PaystackInitiator.
+type psInitiator struct{ c *paystack.Client }
+
+func (p psInitiator) InitiatePayment(ctx context.Context, req workers.PaymentRequest) (workers.PaymentLink, error) {
+	res, err := p.c.InitiatePayment(ctx, paystack.InitiatePaymentRequest{
+		AmountMajor:   req.Amount,
+		Currency:      req.Currency,
+		CustomerPhone: req.CustomerPhone,
+		Reference:     req.Reference,
+		BusinessID:    req.BusinessID,
+		CallbackURL:   req.CallbackURL,
+	})
+	if err != nil {
+		return workers.PaymentLink{}, err
+	}
+	return workers.PaymentLink{ProviderReference: res.ProviderReference, PaymentURL: res.PaymentURL, Status: res.Status}, nil
+}

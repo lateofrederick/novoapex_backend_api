@@ -367,6 +367,8 @@ type Order struct {
 	IdempotencyKey  pgtype.Text      `json:"idempotency_key"`
 	FulfillmentType FulfillmentType  `json:"fulfillment_type"`
 	LocationID      pgtype.Text      `json:"location_id"`
+	PaymentUrl      pgtype.Text      `json:"payment_url"`
+	StatsRecordedAt pgtype.Timestamp `json:"stats_recorded_at"`
 }
 
 type OrderItem struct {
