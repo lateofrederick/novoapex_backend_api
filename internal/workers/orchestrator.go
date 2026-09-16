@@ -1,8 +1,4 @@
-// Stage 8b conversation pipeline worker (T8.14, T8.17–T8.28): the port of
-// libs/orchestrator/src/conversation-orchestrator.service.ts plus the
-// debounce wrapper from libs/queue/src/processors/orchestrator.processor.ts.
-//
-// Phase order (handleConversation, conversation-orchestrator.service.ts:293-324):
+// Package workers Phase order (handleConversation, conversation-orchestrator.service.ts:293-324):
 //  1. resolveConversationContext (:326-384) — business lookup, customer
 //     upsert w/ nested profile create, conversation upsert, inbound backfill
 //  2. latest-message fetch (:301-304)
@@ -649,15 +645,22 @@ func orchGenerateAndHandleLlmResponse(ctx context.Context, deps OrchestratorDeps
 	hasNew := false
 	switch {
 	case resp.Intent == "checkout_request": // (:597-601)
-		if current == domain.StateLead || current == domain.StateBrowsing {
+		switch current {
+		case domain.StateLead, domain.StateBrowsing:
 			newState, hasNew = domain.StateCheckout, true
+		case domain.StatePaid, domain.StateCancelled:
+			// Reorder: a completed/cancelled customer restarts at BROWSING
+			// before reaching CHECKOUT on a later turn.
+			newState, hasNew = domain.StateBrowsing, true
 		}
 	case resp.Intent == "product_inquiry" || resp.Intent == "image_match": // (:602-605)
-		if current == domain.StateLead {
+		switch current {
+		case domain.StateLead, domain.StatePaid, domain.StateCancelled:
 			newState, hasNew = domain.StateBrowsing, true
 		}
 	case resp.Intent == "support_faq" || resp.Intent == "complaint": // (:606-610)
-		if current == domain.StateLead || current == domain.StateBrowsing {
+		switch current {
+		case domain.StateLead, domain.StateBrowsing, domain.StatePaid, domain.StateCancelled:
 			newState, hasNew = domain.StateSupport, true
 		}
 	}

@@ -976,3 +976,38 @@ func TestOpipeCompletionRecheckImmuneToClockSkew(t *testing.T) {
 		t.Errorf("clock-skewed pre-existing message triggered %d re-enqueue(s), want 0", n)
 	}
 }
+
+// F.22 — reorder reset: a customer returning from PAID/CANCELLED with new
+// shopping intent resets to BROWSING (so they can re-enter CHECKOUT later).
+func TestOpipeReorderResetFromPaidOrCancelled(t *testing.T) {
+	for _, start := range []string{"PAID", "CANCELLED"} {
+		t.Run(start, func(t *testing.T) {
+			e := opipeStart(t)
+			biz := e.factory.Business()
+			sender := biz.OwnerPhone
+
+			// First run creates the conversation at LEAD.
+			e.llm.steps = []orchestrator.LlmResponse{opipeResp(nil)}
+			opipeInbound(t, e.db, biz.WhatsAppPhoneNumberID, sender, "wamid-re-1", "hello")
+			opipeRun(t, e, biz, sender)
+
+			if _, err := e.db.Exec(`UPDATE conversations SET state = $3
+				WHERE business_id = $1 AND customer_phone = $2`, biz.ID, sender, start); err != nil {
+				t.Fatal(err)
+			}
+
+			// Customer comes back with new shopping intent.
+			e.llm.steps = []orchestrator.LlmResponse{opipeResp(func(r *orchestrator.LlmResponse) {
+				r.Intent = "product_inquiry"
+				r.ReplyText = "We have that in stock!"
+			})}
+			opipeInbound(t, e.db, biz.WhatsAppPhoneNumberID, sender, "wamid-re-2", "do you have shea butter?")
+			opipeRun(t, e, biz, sender)
+
+			state, _, _ := opipeConvRow(t, e.db, biz.ID, sender)
+			if state != "BROWSING" {
+				t.Errorf("state = %s, want BROWSING (reorder reset from %s)", state, start)
+			}
+		})
+	}
+}
