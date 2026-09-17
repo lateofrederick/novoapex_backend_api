@@ -26,6 +26,11 @@ type Subscription struct {
 	TaskType string
 }
 
+// DeadLetterHook reports an event whose publish attempts are exhausted. It is
+// nil-safe and wired by the worker main to Sentry (mirrors queue.SentryHook);
+// tests may swap it out.
+var DeadLetterHook func(eventType, aggregateID string, err error)
+
 // Dispatcher publishes PENDING events. Consumers are at-least-once and must
 // dedupe on their own natural keys, so re-delivery after a crash is safe.
 type Dispatcher struct {
@@ -112,7 +117,7 @@ func (d *Dispatcher) Drain(ctx context.Context) (int, error) {
 	}
 
 	rows, err := tx.Query(ctx, `
-		SELECT id, event_type, payload::text, attempts
+		SELECT id, aggregate_id, event_type, payload::text, attempts
 		  FROM domain_events
 		 WHERE status = 'PENDING'
 		 ORDER BY occurred_at
@@ -122,15 +127,16 @@ func (d *Dispatcher) Drain(ctx context.Context) (int, error) {
 	}
 
 	type pending struct {
-		id        string
-		eventType string
-		payload   string
-		attempts  int
+		id          string
+		aggregateID string
+		eventType   string
+		payload     string
+		attempts    int
 	}
 	var events []pending
 	for rows.Next() {
 		var p pending
-		if err := rows.Scan(&p.id, &p.eventType, &p.payload, &p.attempts); err != nil {
+		if err := rows.Scan(&p.id, &p.aggregateID, &p.eventType, &p.payload, &p.attempts); err != nil {
 			rows.Close()
 			return 0, fmt.Errorf("events: scan pending: %w", err)
 		}
@@ -159,8 +165,20 @@ func (d *Dispatcher) Drain(ctx context.Context) (int, error) {
 				ev.id, attempts, err.Error(), status); uerr != nil {
 				return 0, fmt.Errorf("events: record failed publish: %w", uerr)
 			}
-			slog.Error("events: publish failed",
-				"event", ev.eventType, "attempts", attempts, "status", status, "err", err)
+			if status == "DEAD" {
+				slog.Error("domain event permanently failed (dead letter)",
+					"event", "event_dead_letter",
+					"eventType", ev.eventType,
+					"aggregateId", ev.aggregateID,
+					"severity", "fatal",
+					"err", err)
+				if DeadLetterHook != nil {
+					DeadLetterHook(ev.eventType, ev.aggregateID, err)
+				}
+			} else {
+				slog.Error("events: publish failed",
+					"eventType", ev.eventType, "attempts", attempts, "err", err)
+			}
 			continue
 		}
 		if _, uerr := tx.Exec(ctx,
@@ -168,6 +186,10 @@ func (d *Dispatcher) Drain(ctx context.Context) (int, error) {
 			ev.id); uerr != nil {
 			return 0, fmt.Errorf("events: mark published: %w", uerr)
 		}
+		slog.Info("domain event published",
+			"event", "event_published",
+			"eventType", ev.eventType,
+			"aggregateId", ev.aggregateID)
 		published++
 	}
 

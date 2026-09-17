@@ -192,6 +192,15 @@ func main() {
 
 	// Event dispatcher: publish PENDING domain_events (order.created etc.) to
 	// their queue subscribers via LISTEN/NOTIFY + a poll backstop.
+	events.DeadLetterHook = func(eventType, aggregateID string, err error) {
+		slog.Log(context.Background(), observability.LevelFatal,
+			"domain event permanently failed (dead letter)",
+			slog.String("event", "event_dead_letter"),
+			slog.String("eventType", eventType),
+			slog.String("aggregateId", aggregateID),
+			slog.String("severity", "fatal"),
+			slog.Any("error", err))
+	}
 	dispatcher := &events.Dispatcher{
 		Pool:      pool,
 		Publisher: client,

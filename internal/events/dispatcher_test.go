@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"testing"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -173,5 +174,57 @@ func TestDispatcherEventWithNoSubscribersStillPublished(t *testing.T) {
 	status, _ := eventStatus(t, pool, "order-3")
 	if status != "PUBLISHED" {
 		t.Errorf("no-subscriber event status = %s, want PUBLISHED (never retried)", status)
+	}
+}
+
+// F.28 — end-to-end: a committed producer NOTIFY wakes the dispatcher (no poll
+// backstop needed) and the subscriber receives its job.
+func TestDispatcherListenNotifyEndToEnd(t *testing.T) {
+	pool := evtStartDB(t)
+	pub := &capturePublisher{}
+	d := &events.Dispatcher{
+		Pool:      pool,
+		Publisher: pub,
+		Subscriptions: map[string][]events.Subscription{
+			events.TypeOrderCreated: {{Queue: queue.QPaymentInit, TaskType: queue.TaskPaymentInit}},
+		},
+		PollInterval: time.Hour, // disable the backstop: only NOTIFY may publish
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- d.Run(ctx) }()
+
+	// Let Run LISTEN and finish its initial (empty) drain before the event
+	// exists, so a timely publish can only come from the NOTIFY path.
+	time.Sleep(300 * time.Millisecond)
+
+	insertEvent(t, pool, events.Event{
+		AggregateType: events.AggregateTypeOrder,
+		AggregateID:   "order-notify",
+		Type:          events.TypeOrderCreated,
+		Payload:       events.OrderCreated{OrderID: "order-notify"},
+	})
+
+	deadline := time.After(5 * time.Second)
+	for {
+		select {
+		case <-deadline:
+			t.Fatal("event was not published via NOTIFY within 5s")
+		default:
+		}
+		if len(pub.jobs) > 0 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	if len(pub.jobs) != 1 || pub.jobs[0].taskType != queue.TaskPaymentInit {
+		t.Fatalf("published jobs = %+v, want exactly one TaskPaymentInit", pub.jobs)
+	}
+	status, _ := eventStatus(t, pool, "order-notify")
+	if status != "PUBLISHED" {
+		t.Errorf("event status = %s, want PUBLISHED", status)
 	}
 }
