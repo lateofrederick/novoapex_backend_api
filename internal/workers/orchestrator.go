@@ -1,8 +1,4 @@
-// Stage 8b conversation pipeline worker (T8.14, T8.17–T8.28): the port of
-// libs/orchestrator/src/conversation-orchestrator.service.ts plus the
-// debounce wrapper from libs/queue/src/processors/orchestrator.processor.ts.
-//
-// Phase order (handleConversation, conversation-orchestrator.service.ts:293-324):
+// Package workers Phase order (handleConversation, conversation-orchestrator.service.ts:293-324):
 //  1. resolveConversationContext (:326-384) — business lookup, customer
 //     upsert w/ nested profile create, conversation upsert, inbound backfill
 //  2. latest-message fetch (:301-304)
@@ -647,23 +643,24 @@ func orchGenerateAndHandleLlmResponse(ctx context.Context, deps OrchestratorDeps
 	current := oc.state
 	newState := domain.ConversationState("")
 	hasNew := false
-	sig := resp.CrmSignals
 	switch {
-	case sig.OrderConfirmed && len(sig.DetectedItems) > 0:
-		// Order confirmed → INVOICING (from any active state) (:589-596).
-		if current != domain.StateInvoicing && current != domain.StateEscalated {
-			newState, hasNew = domain.StateInvoicing, true
-		}
 	case resp.Intent == "checkout_request": // (:597-601)
-		if current == domain.StateLead || current == domain.StateBrowsing {
+		switch current {
+		case domain.StateLead, domain.StateBrowsing:
 			newState, hasNew = domain.StateCheckout, true
+		case domain.StatePaid, domain.StateCancelled:
+			// Reorder: a completed/cancelled customer restarts at BROWSING
+			// before reaching CHECKOUT on a later turn.
+			newState, hasNew = domain.StateBrowsing, true
 		}
 	case resp.Intent == "product_inquiry" || resp.Intent == "image_match": // (:602-605)
-		if current == domain.StateLead {
+		switch current {
+		case domain.StateLead, domain.StatePaid, domain.StateCancelled:
 			newState, hasNew = domain.StateBrowsing, true
 		}
 	case resp.Intent == "support_faq" || resp.Intent == "complaint": // (:606-610)
-		if current == domain.StateLead || current == domain.StateBrowsing {
+		switch current {
+		case domain.StateLead, domain.StateBrowsing, domain.StatePaid, domain.StateCancelled:
 			newState, hasNew = domain.StateSupport, true
 		}
 	}
@@ -678,11 +675,22 @@ func orchGenerateAndHandleLlmResponse(ctx context.Context, deps OrchestratorDeps
 		}
 	}
 
-	// Stealth CRM emission (:626-643) — MUST NOT block the reply; failures
-	// logged and swallowed.
+	// Stealth CRM enrichment (:626-643) — MUST NOT block the reply; failures
+	// logged and swallowed. Order creation is a separate checkout job: this
+	// signal only carries profile/name/opt-in enrichment.
 	crmJob := orchCRMSignalJob(oc, latest, resp)
 	if err := deps.Publisher.Enqueue(ctx, queue.QCRMMaterialiser, queue.TaskCRMProcess, crmJob, nil); err != nil {
 		slog.Warn("Failed to emit CRM signals (non-blocking)", "err", err)
+	}
+
+	// Checkout: when the turn confirmed an order, fan out to the checkout
+	// pipeline (order + state flip + order.created), which owns the
+	// CHECKOUT -> INVOICING transition and the one-order-at-a-time guard.
+	if resp.CrmSignals.OrderConfirmed && len(resp.CrmSignals.DetectedItems) > 0 {
+		checkoutJob := orchCheckoutJob(oc, latest, resp)
+		if err := deps.Publisher.Enqueue(ctx, queue.QCheckout, queue.TaskCheckout, checkoutJob, nil); err != nil {
+			slog.Warn("Failed to emit checkout job (non-blocking)", "err", err)
+		}
 	}
 	return nil
 }

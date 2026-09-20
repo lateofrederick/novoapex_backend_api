@@ -32,6 +32,7 @@ func CronSpecs() []CronEntry {
 		{Spec: "follow-up-scanner", Cron: "*/1 * * * *", TaskType: "cron:follow-up-scanner"},
 		{Spec: "outbox-sweep", Cron: "*/2 * * * *", TaskType: "cron:outbox-sweep"},
 		{Spec: "retention-scanner", Cron: "0 9 * * *", TaskType: "cron:retention-scanner"},
+		{Spec: "checkout-expiry", Cron: "*/10 * * * *", TaskType: "cron:checkout-expiry"},
 		// 8am — an hour ahead of retention-scanner, to spread cron load.
 		{Spec: "new-arrivals-scanner", Cron: "0 8 * * *", TaskType: "cron:new-arrivals-scanner"},
 	}

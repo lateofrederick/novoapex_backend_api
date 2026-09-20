@@ -331,6 +331,29 @@ func orchCRMSignalJob(oc orchContext, latest *orchLatest, resp orchestrator.LlmR
 	}
 }
 
+// orchCheckoutJob builds the checkout payload from a confirmed turn: only the
+// order-relevant fields. The CRM enrichment signal travels separately.
+func orchCheckoutJob(oc orchContext, latest *orchLatest, resp orchestrator.LlmResponse) CheckoutJob {
+	items := make([]DetectedItem, len(resp.CrmSignals.DetectedItems))
+	for i, it := range resp.CrmSignals.DetectedItems {
+		items[i] = DetectedItem{ProductID: it.ProductID, Quantity: int32(it.Quantity)}
+	}
+	source := ""
+	if latest != nil {
+		source = latest.whatsappID
+	}
+	return CheckoutJob{
+		BusinessID:        oc.businessID,
+		CustomerID:        oc.customerID,
+		ConversationID:    oc.conversationID,
+		CustomerPhone:     oc.customerPhone,
+		SourceMessageID:   source,
+		DetectedItems:     items,
+		FulfillmentChoice: resp.CrmSignals.FulfillmentChoice,
+		PickupLocationID:  resp.CrmSignals.PickupLocationID,
+	}
+}
+
 // ---------------------------------------------------------------------------
 // currency display config (currency.config.ts port for message copy)
 // ---------------------------------------------------------------------------

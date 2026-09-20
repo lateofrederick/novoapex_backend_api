@@ -1,9 +1,8 @@
 package workers_test
 
-// crm_handlers_fulfillment_test.go covers crmResolveFulfillment (this
-// session's Node work: OrderLedgerHandler.resolveFulfillment /
-// resolvePickupLocation) through the public workers.HandleCRMSignals entry
-// point, mirroring TestS7b_TwoTurnHappyPath's shape.
+// crm_handlers_fulfillment_test.go covers checkout's fulfillment resolution
+// (this session's Node work: OrderLedgerHandler.resolveFulfillment /
+// resolvePickupLocation), now exercised through workers.HandleCheckout.
 
 import (
 	"database/sql"
@@ -32,20 +31,26 @@ func s7bSeedLocation(t *testing.T, bizID string, offersPickup, isActive bool) st
 	return id
 }
 
+// s7bFulfilmentCheckout builds a single-item checkout job, optionally choosing
+// a pickup location.
+func s7bFulfilmentCheckout(bizID, custID, convID, phone, sourceMsg, productID string, choice, locationID *string) workers.CheckoutJob {
+	job := s7bCheckoutJob(bizID, custID, convID, phone, sourceMsg,
+		[]workers.DetectedItem{{ProductID: productID, Quantity: 1}})
+	job.FulfillmentChoice = choice
+	job.PickupLocationID = locationID
+	return job
+}
+
 func TestS7b_Fulfillment_DefaultsToDeliveryWhenUnset(t *testing.T) {
 	env = s7bNewEnv(t)
 
 	biz := env.dbw.factory.Business()
 	prod := env.dbw.factory.Product(biz.ID, harness.WithStock(5), harness.WithPrice("10.00"))
 	cust := env.dbw.factory.Customer(biz.ID)
-	conv := env.dbw.factory.Conversation(biz.ID, cust.Phone, harness.WithLinkedCustomer(cust.ID))
+	conv := env.dbw.factory.Conversation(biz.ID, cust.Phone,
+		harness.WithLinkedCustomer(cust.ID), harness.WithState("CHECKOUT"))
 
-	job := s7bBaseJob(biz.ID, cust.ID, conv.ID, cust.Phone, "wamid.fulfil-1")
-	job.CRMSignals.OrderConfirmed = true
-	job.CRMSignals.DetectedItems = []workers.DetectedItem{{ProductID: prod.ID[:8], Quantity: 1}}
-	if err := workers.HandleCRMSignals(ctx(), env.deps, job); err != nil {
-		t.Fatalf("HandleCRMSignals: %v", err)
-	}
+	s7bRunCheckout(t, s7bFulfilmentCheckout(biz.ID, cust.ID, conv.ID, cust.Phone, "wamid.fulfil-1", prod.ID[:8], nil, nil))
 
 	orderID := s7bScalarString(t, `SELECT id FROM orders WHERE conversation_id = $1`, conv.ID)
 	if ft := s7bScalarString(t, `SELECT fulfillment_type::text FROM orders WHERE id = $1`, orderID); ft != "DELIVERY" {
@@ -66,18 +71,12 @@ func TestS7b_Fulfillment_PickupResolvesLocation(t *testing.T) {
 	biz := env.dbw.factory.Business()
 	prod := env.dbw.factory.Product(biz.ID, harness.WithStock(5), harness.WithPrice("10.00"))
 	cust := env.dbw.factory.Customer(biz.ID)
-	conv := env.dbw.factory.Conversation(biz.ID, cust.Phone, harness.WithLinkedCustomer(cust.ID))
+	conv := env.dbw.factory.Conversation(biz.ID, cust.Phone,
+		harness.WithLinkedCustomer(cust.ID), harness.WithState("CHECKOUT"))
 	locID := s7bSeedLocation(t, biz.ID, true, true)
 	shortLocID := locID[:8]
 
-	job := s7bBaseJob(biz.ID, cust.ID, conv.ID, cust.Phone, "wamid.fulfil-2")
-	job.CRMSignals.OrderConfirmed = true
-	job.CRMSignals.DetectedItems = []workers.DetectedItem{{ProductID: prod.ID[:8], Quantity: 1}}
-	job.CRMSignals.FulfillmentChoice = s7bPtr("pickup")
-	job.CRMSignals.PickupLocationID = s7bPtr(shortLocID)
-	if err := workers.HandleCRMSignals(ctx(), env.deps, job); err != nil {
-		t.Fatalf("HandleCRMSignals: %v", err)
-	}
+	s7bRunCheckout(t, s7bFulfilmentCheckout(biz.ID, cust.ID, conv.ID, cust.Phone, "wamid.fulfil-2", prod.ID[:8], s7bPtr("pickup"), s7bPtr(shortLocID)))
 
 	orderID := s7bScalarString(t, `SELECT id FROM orders WHERE conversation_id = $1`, conv.ID)
 	if ft := s7bScalarString(t, `SELECT fulfillment_type::text FROM orders WHERE id = $1`, orderID); ft != "PICKUP" {
@@ -94,16 +93,10 @@ func TestS7b_Fulfillment_PickupUnresolvableLocationStillCreatesOrder(t *testing.
 	biz := env.dbw.factory.Business()
 	prod := env.dbw.factory.Product(biz.ID, harness.WithStock(5), harness.WithPrice("10.00"))
 	cust := env.dbw.factory.Customer(biz.ID)
-	conv := env.dbw.factory.Conversation(biz.ID, cust.Phone, harness.WithLinkedCustomer(cust.ID))
+	conv := env.dbw.factory.Conversation(biz.ID, cust.Phone,
+		harness.WithLinkedCustomer(cust.ID), harness.WithState("CHECKOUT"))
 
-	job := s7bBaseJob(biz.ID, cust.ID, conv.ID, cust.Phone, "wamid.fulfil-3")
-	job.CRMSignals.OrderConfirmed = true
-	job.CRMSignals.DetectedItems = []workers.DetectedItem{{ProductID: prod.ID[:8], Quantity: 1}}
-	job.CRMSignals.FulfillmentChoice = s7bPtr("pickup")
-	job.CRMSignals.PickupLocationID = s7bPtr("deadbeef") // well-formed hex, matches nothing
-	if err := workers.HandleCRMSignals(ctx(), env.deps, job); err != nil {
-		t.Fatalf("HandleCRMSignals: %v (must not block order creation)", err)
-	}
+	s7bRunCheckout(t, s7bFulfilmentCheckout(biz.ID, cust.ID, conv.ID, cust.Phone, "wamid.fulfil-3", prod.ID[:8], s7bPtr("pickup"), s7bPtr("deadbeef")))
 
 	orderID := s7bScalarString(t, `SELECT id FROM orders WHERE conversation_id = $1`, conv.ID)
 	if ft := s7bScalarString(t, `SELECT fulfillment_type::text FROM orders WHERE id = $1`, orderID); ft != "PICKUP" {
@@ -124,18 +117,12 @@ func TestS7b_Fulfillment_PickupOnlyResolvesActivePickupEnabledLocations(t *testi
 	biz := env.dbw.factory.Business()
 	prod := env.dbw.factory.Product(biz.ID, harness.WithStock(5), harness.WithPrice("10.00"))
 	cust := env.dbw.factory.Customer(biz.ID)
-	conv := env.dbw.factory.Conversation(biz.ID, cust.Phone, harness.WithLinkedCustomer(cust.ID))
+	conv := env.dbw.factory.Conversation(biz.ID, cust.Phone,
+		harness.WithLinkedCustomer(cust.ID), harness.WithState("CHECKOUT"))
 	// Location exists but does not offer pickup — must not resolve.
 	locID := s7bSeedLocation(t, biz.ID, false, true)
 
-	job := s7bBaseJob(biz.ID, cust.ID, conv.ID, cust.Phone, "wamid.fulfil-4")
-	job.CRMSignals.OrderConfirmed = true
-	job.CRMSignals.DetectedItems = []workers.DetectedItem{{ProductID: prod.ID[:8], Quantity: 1}}
-	job.CRMSignals.FulfillmentChoice = s7bPtr("pickup")
-	job.CRMSignals.PickupLocationID = s7bPtr(locID[:8])
-	if err := workers.HandleCRMSignals(ctx(), env.deps, job); err != nil {
-		t.Fatalf("HandleCRMSignals: %v", err)
-	}
+	s7bRunCheckout(t, s7bFulfilmentCheckout(biz.ID, cust.ID, conv.ID, cust.Phone, "wamid.fulfil-4", prod.ID[:8], s7bPtr("pickup"), s7bPtr(locID[:8])))
 
 	orderID := s7bScalarString(t, `SELECT id FROM orders WHERE conversation_id = $1`, conv.ID)
 	var locationID sql.NullString

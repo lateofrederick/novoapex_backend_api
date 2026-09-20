@@ -24,6 +24,8 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/shopspring/decimal"
 
+	"github.com/novoapex/novoapex-backend-api/internal/domain"
+	"github.com/novoapex/novoapex-backend-api/internal/events"
 	"github.com/novoapex/novoapex-backend-api/internal/integrations/paystack"
 	"github.com/novoapex/novoapex-backend-api/internal/money"
 	"github.com/novoapex/novoapex-backend-api/internal/queue"
@@ -134,10 +136,8 @@ func HandlePaymentEvent(ctx context.Context, deps Deps, evt paystack.NormalisedP
 		default:
 			if total.Equal(amountMajor) {
 				businessID, customerID, orderID = oBiz, oCust, evt.Reference
-				if _, err := pool.Exec(ctx,
-					`UPDATE orders SET status = 'PAID', updated_at = $2 WHERE id = $1`,
-					evt.Reference, now); err != nil {
-					return fmt.Errorf("payment-events: mark order PAID: %w", err)
+				if err := settleReconciledOrder(ctx, pool, evt, evt.Reference, now); err != nil {
+					return err
 				}
 				slog.InfoContext(ctx, "Payment reconciled with order by reference",
 					"event", "payment_reconciled",
@@ -209,10 +209,8 @@ func HandlePaymentEvent(ctx context.Context, deps Deps, evt paystack.NormalisedP
 		case len(candidates) == 1:
 			match := candidates[0]
 			customerID, businessID, orderID = match.customerID, match.businessID, match.orderID
-			if _, err := pool.Exec(ctx,
-				`UPDATE orders SET status = 'PAID', updated_at = $2 WHERE id = $1`,
-				match.orderID, now); err != nil {
-				return fmt.Errorf("payment-events: mark order PAID: %w", err)
+			if err := settleReconciledOrder(ctx, pool, evt, match.orderID, now); err != nil {
+				return err
 			}
 			slog.InfoContext(ctx, "Payment reconciled with order by phone+amount",
 				"event", "payment_reconciled",
@@ -339,6 +337,85 @@ func paymentStatusFor(normalisedStatus string) string {
 	default:
 		return "PENDING"
 	}
+}
+
+// settleReconciledOrder applies the payment outcome to a reconciled order and
+// its conversation state:
+//
+//	success -> order PAID + conversation INVOICING -> PAID
+//	failed  -> order CANCELLED + conversation INVOICING -> CANCELLED
+//	           + order.cancelled event (for restock / reset)
+//
+// Anything else that reconciled (e.g. a "pending" mobile-money settle) is
+// treated as paid, matching the reconciliation's amount-match contract.
+func settleReconciledOrder(ctx context.Context, pool *pgxpool.Pool, evt paystack.NormalisedPaymentEvent, orderID string, now time.Time) error {
+	if evt.Status == "failed" {
+		return cancelOrder(ctx, pool, orderID, "payment_failed", now)
+	}
+	if _, err := pool.Exec(ctx,
+		`UPDATE orders SET status = 'PAID', updated_at = $2 WHERE id = $1`, orderID, now); err != nil {
+		return fmt.Errorf("payment-events: mark order PAID: %w", err)
+	}
+	return transitionOrderConversation(ctx, pool, orderID, domain.StateInvoicing, domain.StatePaid)
+}
+
+// cancelOrder marks the order CANCELLED (unless already paid), closes the
+// conversation INVOICING -> CANCELLED and emits order.cancelled — all in one
+// transaction so the event can never exist without its state change. Shared by
+// the failed-payment path and the checkout-expiry scanner.
+func cancelOrder(ctx context.Context, pool *pgxpool.Pool, orderID, reason string, now time.Time) error {
+	return pgx.BeginFunc(ctx, pool, func(tx pgx.Tx) error {
+		tag, err := tx.Exec(ctx,
+			`UPDATE orders SET status = 'CANCELLED', updated_at = $2
+			  WHERE id = $1 AND status IN ('CONFIRMED', 'PAYMENT_PENDING')`, orderID, now)
+		if err != nil {
+			return err
+		}
+		if tag.RowsAffected() == 0 {
+			return nil // already paid / cancelled / missing
+		}
+
+		var convID string
+		if err := tx.QueryRow(ctx,
+			`SELECT COALESCE(conversation_id, '') FROM orders WHERE id = $1`, orderID).Scan(&convID); err != nil {
+			return err
+		}
+		if convID != "" {
+			if _, err := domain.TransitionTx(ctx, tx, convID, domain.StateInvoicing, domain.StateCancelled); err != nil {
+				return err
+			}
+		}
+
+		_, err = events.Insert(ctx, tx, events.Event{
+			AggregateType: events.AggregateTypeOrder,
+			AggregateID:   orderID,
+			Type:          events.TypeOrderCancelled,
+			Payload:       events.OrderCancelled{OrderID: orderID, Reason: reason},
+		})
+		return err
+	})
+}
+
+// transitionOrderConversation transitions the order's conversation from `from`
+// to `to`; a no-op when the order has no conversation or already left `from`.
+func transitionOrderConversation(ctx context.Context, pool *pgxpool.Pool, orderID string, from, to domain.ConversationState) error {
+	var convID string
+	if err := pool.QueryRow(ctx,
+		`SELECT COALESCE(conversation_id, '') FROM orders WHERE id = $1`, orderID).Scan(&convID); err != nil {
+		return fmt.Errorf("payment-events: order conversation lookup: %w", err)
+	}
+	if convID == "" {
+		return nil
+	}
+	ok, err := domain.Transition(ctx, pool, convID, from, to)
+	if err != nil {
+		return err
+	}
+	if !ok {
+		slog.InfoContext(ctx, "Order conversation transition skipped",
+			"orderId", orderID, "from", from, "to", to)
+	}
+	return nil
 }
 
 type paymentInsert struct {

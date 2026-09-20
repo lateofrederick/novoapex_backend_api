@@ -193,17 +193,6 @@ func opipeResp(mutate func(*orchestrator.LlmResponse)) orchestrator.LlmResponse 
 	return r
 }
 
-type opipePaystack struct{ requests int }
-
-func (f *opipePaystack) InitiatePayment(_ context.Context, req workers.PaymentRequest) (workers.PaymentLink, error) {
-	f.requests++
-	return workers.PaymentLink{
-		Status:            "initiated",
-		ProviderReference: "ref-fixed",
-		PaymentURL:        "https://checkout.paystack.test/pay/ref-fixed",
-	}, nil
-}
-
 // ---------------------------------------------------------------------------
 // helpers
 // ---------------------------------------------------------------------------
@@ -253,9 +242,9 @@ func opipeScalarInt(t *testing.T, db *sql.DB, q string, args ...any) int {
 	return n
 }
 
-func opipeDrainCRM(t *testing.T, e *opipeEnv, paystack *opipePaystack) {
+func opipeDrainCRM(t *testing.T, e *opipeEnv) {
 	t.Helper()
-	crm := workers.CRMDeps{Pool: e.pool, Publisher: e.publisher, Paystack: paystack}
+	crm := workers.CRMDeps{Pool: e.pool}
 	for _, j := range e.publisher.ofTask(queue.TaskCRMProcess) {
 		var job workers.CRMSignalJob
 		if err := json.Unmarshal(j.Payload, &job); err != nil {
@@ -263,6 +252,20 @@ func opipeDrainCRM(t *testing.T, e *opipeEnv, paystack *opipePaystack) {
 		}
 		if err := workers.HandleCRMSignals(context.Background(), crm, job); err != nil {
 			t.Fatalf("drain crm job: %v", err)
+		}
+	}
+}
+
+func opipeDrainCheckout(t *testing.T, e *opipeEnv) {
+	t.Helper()
+	checkout := workers.CheckoutDeps{Pool: e.pool}
+	for _, j := range e.publisher.ofTask(queue.TaskCheckout) {
+		var job workers.CheckoutJob
+		if err := json.Unmarshal(j.Payload, &job); err != nil {
+			t.Fatalf("decode checkout job: %v", err)
+		}
+		if err := workers.HandleCheckout(context.Background(), checkout, job); err != nil {
+			t.Fatalf("drain checkout job: %v", err)
 		}
 	}
 }
@@ -302,7 +305,7 @@ func TestOpipeTwoTurnHappyPathCreatesOrderAndTransitions(t *testing.T) {
 		t.Fatal(err)
 	}
 	opipeRun(t, e, biz, sender)
-	opipeDrainCRM(t, e, &opipePaystack{})
+	opipeDrainCRM(t, e)
 	dec1, _, err := harness.CollectTurnDecision(e.db, before1, "product_inquiry", tokens)
 	if err != nil {
 		t.Fatal(err)
@@ -373,7 +376,8 @@ func TestOpipeTwoTurnHappyPathCreatesOrderAndTransitions(t *testing.T) {
 		t.Fatal(err)
 	}
 	opipeRun(t, e, biz, sender)
-	opipeDrainCRM(t, e, &opipePaystack{}) // S7B consumes synchronously here
+	opipeDrainCheckout(t, e) // checkout owns order creation + BROWSING->INVOICING
+	opipeDrainCRM(t, e)      // enrichment lands synchronously here
 	dec2, _, err := harness.CollectTurnDecision(e.db, before2, "product_inquiry", tokens)
 	if err != nil {
 		t.Fatal(err)
@@ -384,7 +388,7 @@ func TestOpipeTwoTurnHappyPathCreatesOrderAndTransitions(t *testing.T) {
 		StateTransition: "BROWSING->INVOICING",
 		ImageIDsSent:    []string{},
 		CRMSignals:      "orders=1,total=51.00|sentiment=positive|area=Osu",
-		ReplyLenBucket:  "l", // payment-link invoice text from the materialiser
+		ReplyLenBucket:  "s", // the LLM confirmation reply (invoice copy is a Phase 3 consumer)
 	}
 	if diffs := harness.DiffDecisions([]harness.TurnDecision{want2}, []harness.TurnDecision{dec2}); len(diffs) > 0 {
 		t.Errorf("turn2 vector diffs: %v", diffs)
@@ -970,5 +974,40 @@ func TestOpipeCompletionRecheckImmuneToClockSkew(t *testing.T) {
 	}
 	if n := len(e.publisher.ofTask(queue.TaskOrchestratorDebounce)); n != 0 {
 		t.Errorf("clock-skewed pre-existing message triggered %d re-enqueue(s), want 0", n)
+	}
+}
+
+// F.22 — reorder reset: a customer returning from PAID/CANCELLED with new
+// shopping intent resets to BROWSING (so they can re-enter CHECKOUT later).
+func TestOpipeReorderResetFromPaidOrCancelled(t *testing.T) {
+	for _, start := range []string{"PAID", "CANCELLED"} {
+		t.Run(start, func(t *testing.T) {
+			e := opipeStart(t)
+			biz := e.factory.Business()
+			sender := biz.OwnerPhone
+
+			// First run creates the conversation at LEAD.
+			e.llm.steps = []orchestrator.LlmResponse{opipeResp(nil)}
+			opipeInbound(t, e.db, biz.WhatsAppPhoneNumberID, sender, "wamid-re-1", "hello")
+			opipeRun(t, e, biz, sender)
+
+			if _, err := e.db.Exec(`UPDATE conversations SET state = $3
+				WHERE business_id = $1 AND customer_phone = $2`, biz.ID, sender, start); err != nil {
+				t.Fatal(err)
+			}
+
+			// Customer comes back with new shopping intent.
+			e.llm.steps = []orchestrator.LlmResponse{opipeResp(func(r *orchestrator.LlmResponse) {
+				r.Intent = "product_inquiry"
+				r.ReplyText = "We have that in stock!"
+			})}
+			opipeInbound(t, e.db, biz.WhatsAppPhoneNumberID, sender, "wamid-re-2", "do you have shea butter?")
+			opipeRun(t, e, biz, sender)
+
+			state, _, _ := opipeConvRow(t, e.db, biz.ID, sender)
+			if state != "BROWSING" {
+				t.Errorf("state = %s, want BROWSING (reorder reset from %s)", state, start)
+			}
+		})
 	}
 }

@@ -22,6 +22,8 @@ const (
 	ConversationStateSUPPORT   ConversationState = "SUPPORT"
 	ConversationStateESCALATED ConversationState = "ESCALATED"
 	ConversationStateCHECKOUT  ConversationState = "CHECKOUT"
+	ConversationStatePAID      ConversationState = "PAID"
+	ConversationStateCANCELLED ConversationState = "CANCELLED"
 )
 
 func (e *ConversationState) Scan(src interface{}) error {
@@ -57,6 +59,49 @@ func (ns NullConversationState) Value() (driver.Value, error) {
 		return nil, nil
 	}
 	return string(ns.ConversationState), nil
+}
+
+type EventStatus string
+
+const (
+	EventStatusPENDING   EventStatus = "PENDING"
+	EventStatusPUBLISHED EventStatus = "PUBLISHED"
+	EventStatusDEAD      EventStatus = "DEAD"
+)
+
+func (e *EventStatus) Scan(src interface{}) error {
+	switch s := src.(type) {
+	case []byte:
+		*e = EventStatus(s)
+	case string:
+		*e = EventStatus(s)
+	default:
+		return fmt.Errorf("unsupported scan type for EventStatus: %T", src)
+	}
+	return nil
+}
+
+type NullEventStatus struct {
+	EventStatus EventStatus `json:"EventStatus"`
+	Valid       bool        `json:"valid"` // Valid is true if EventStatus is not NULL
+}
+
+// Scan implements the Scanner interface.
+func (ns *NullEventStatus) Scan(value interface{}) error {
+	if value == nil {
+		ns.EventStatus, ns.Valid = "", false
+		return nil
+	}
+	ns.Valid = true
+	return ns.EventStatus.Scan(value)
+}
+
+// Value implements the driver Valuer interface.
+func (ns NullEventStatus) Value() (driver.Value, error) {
+	if !ns.Valid {
+		return nil, nil
+	}
+	return string(ns.EventStatus), nil
 }
 
 type FulfillmentType string
@@ -271,6 +316,19 @@ type CustomerProfile struct {
 	PreferredPaymentNetwork pgtype.Text      `json:"preferred_payment_network"`
 }
 
+type DomainEvent struct {
+	ID            string           `json:"id"`
+	AggregateType string           `json:"aggregate_type"`
+	AggregateID   string           `json:"aggregate_id"`
+	EventType     string           `json:"event_type"`
+	Payload       []byte           `json:"payload"`
+	OccurredAt    pgtype.Timestamp `json:"occurred_at"`
+	PublishedAt   pgtype.Timestamp `json:"published_at"`
+	Attempts      int32            `json:"attempts"`
+	LastError     pgtype.Text      `json:"last_error"`
+	Status        EventStatus      `json:"status"`
+}
+
 type Faq struct {
 	ID         string           `json:"id"`
 	BusinessID string           `json:"business_id"`
@@ -309,6 +367,9 @@ type Order struct {
 	IdempotencyKey  pgtype.Text      `json:"idempotency_key"`
 	FulfillmentType FulfillmentType  `json:"fulfillment_type"`
 	LocationID      pgtype.Text      `json:"location_id"`
+	PaymentUrl      pgtype.Text      `json:"payment_url"`
+	StatsRecordedAt pgtype.Timestamp `json:"stats_recorded_at"`
+	StockRestoredAt pgtype.Timestamp `json:"stock_restored_at"`
 }
 
 type OrderItem struct {

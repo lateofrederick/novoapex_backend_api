@@ -4,7 +4,6 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
-	"errors"
 	"net"
 	"net/http"
 	"os"
@@ -127,36 +126,6 @@ func (p *s7bPublisher) snapshot() []s7bEnqueuedJob {
 
 var _ queue.Publisher = (*s7bPublisher)(nil)
 
-type s7bPaystack struct {
-	mu       sync.Mutex
-	requests []workers.PaymentRequest
-	fail     bool
-}
-
-func (f *s7bPaystack) InitiatePayment(_ context.Context, req workers.PaymentRequest) (workers.PaymentLink, error) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	f.requests = append(f.requests, req)
-	if f.fail {
-		return workers.PaymentLink{Status: "failed"}, errors.New("paystack transport down")
-	}
-	return workers.PaymentLink{
-		Status:            "initiated",
-		ProviderReference: "ref-" + req.Reference,
-		PaymentURL:        "https://checkout.paystack.test/pay/" + req.Reference,
-	}, nil
-}
-
-func (f *s7bPaystack) snapshot() []workers.PaymentRequest {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	out := make([]workers.PaymentRequest, len(f.requests))
-	copy(out, f.requests)
-	return out
-}
-
-var _ workers.PaystackInitiator = (*s7bPaystack)(nil)
-
 // ---------------------------------------------------------------------------
 // shared env + job builders
 // ---------------------------------------------------------------------------
@@ -164,8 +133,8 @@ var _ workers.PaystackInitiator = (*s7bPaystack)(nil)
 type s7bEnv struct {
 	dbw       *s7bDB
 	publisher *s7bPublisher
-	paystack  *s7bPaystack
-	deps      workers.CRMDeps
+	deps      workers.CRMDeps      // CRM enrichment (profile/name/opt-in)
+	checkout  workers.CheckoutDeps // order creation
 }
 
 func s7bNewEnv(t *testing.T) *s7bEnv {
@@ -174,13 +143,9 @@ func s7bNewEnv(t *testing.T) *s7bEnv {
 	e := &s7bEnv{
 		dbw:       dbw,
 		publisher: &s7bPublisher{},
-		paystack:  &s7bPaystack{},
 	}
-	e.deps = workers.CRMDeps{
-		Pool:      dbw.pool,
-		Publisher: e.publisher,
-		Paystack:  e.paystack,
-	}
+	e.deps = workers.CRMDeps{Pool: dbw.pool}
+	e.checkout = workers.CheckoutDeps{Pool: dbw.pool}
 	return e
 }
 
@@ -207,5 +172,25 @@ func s7bBaseJob(bizID, custID, convID, phone, sourceMsg string) workers.CRMSigna
 			DetectedPreferences: []string{},
 			Sentiment:           s7bPtr("neutral"),
 		},
+	}
+}
+
+// s7bCheckoutJob builds a checkout payload from the order-relevant fields.
+func s7bCheckoutJob(bizID, custID, convID, phone, sourceMsg string, items []workers.DetectedItem) workers.CheckoutJob {
+	return workers.CheckoutJob{
+		BusinessID:      bizID,
+		CustomerID:      custID,
+		ConversationID:  convID,
+		CustomerPhone:   phone,
+		SourceMessageID: sourceMsg,
+		DetectedItems:   items,
+	}
+}
+
+// s7bRunCheckout drives the checkout pipeline for one confirmed order.
+func s7bRunCheckout(t *testing.T, job workers.CheckoutJob) {
+	t.Helper()
+	if err := workers.HandleCheckout(ctx(), env.checkout, job); err != nil {
+		t.Fatalf("HandleCheckout: %v", err)
 	}
 }
