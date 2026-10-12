@@ -18,12 +18,12 @@ import (
 // nodemailer renders {text, html} as a multipart/alternative entity; the same
 // structure is produced here.
 func SendOTPEmail(cfg Config, to, code string) error {
-	from := fmt.Sprintf(`"NovoApex Auth" <%s>`, cfg.User)
-	subject := "Your NovoApex Login Code"
+	from := fmt.Sprintf(`"Intellnovo Auth" <%s>`, cfg.User)
+	subject := "Your Intellnovo Login Code"
 
-	text := fmt.Sprintf("Your NovoApex login code is: %s. It will expire in 5 minutes.", code)
+	text := fmt.Sprintf("Your Intellnovo login code is: %s. It will expire in 5 minutes.", code)
 	html := fmt.Sprintf(
-		"<p>Your NovoApex login code is: <strong>%s</strong>.</p><p>It will expire in 5 minutes.</p>",
+		"<p>Your Intellnovo login code is: <strong>%s</strong>.</p><p>It will expire in 5 minutes.</p>",
 		code)
 
 	body, contentType := buildAlternative(text, html)
