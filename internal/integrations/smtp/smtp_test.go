@@ -184,12 +184,12 @@ func TestS3_SendOTPEmail_TemplateParity(t *testing.T) {
 	}
 	m := msgs[0]
 	wantSubstrings := []string{
-		`From: "NovoApex Auth" <auth@novoapex.test>`,
+		`From: "Intellnovo Auth" <auth@novoapex.test>`,
 		"To: vendor@example.com",
-		"Subject: Your NovoApex Login Code",
+		"Subject: Your Intellnovo Login Code",
 		"multipart/alternative",
-		"Your NovoApex login code is: 123456. It will expire in 5 minutes.",
-		"<p>Your NovoApex login code is: <strong>123456</strong>.</p><p>It will expire in 5 minutes.</p>",
+		"Your Intellnovo login code is: 123456. It will expire in 5 minutes.",
+		"<p>Your Intellnovo login code is: <strong>123456</strong>.</p><p>It will expire in 5 minutes.</p>",
 	}
 	for _, want := range wantSubstrings {
 		if !strings.Contains(m, want) {
