@@ -23,6 +23,7 @@ import (
 	"github.com/novoapex/novoapex-backend-api/internal/config"
 	"github.com/novoapex/novoapex-backend-api/internal/db"
 	"github.com/novoapex/novoapex-backend-api/internal/events"
+	"github.com/novoapex/novoapex-backend-api/internal/integrations/expo"
 	"github.com/novoapex/novoapex-backend-api/internal/integrations/google"
 	"github.com/novoapex/novoapex-backend-api/internal/integrations/openai"
 	"github.com/novoapex/novoapex-backend-api/internal/integrations/paystack"
@@ -98,6 +99,10 @@ func main() {
 	gemini := google.New(google.Config{APIKey: cfg.GoogleGenerativeAIAPIKey, BaseURL: os.Getenv("GOOGLE_GENERATIVE_AI_BASE_URL")})
 	wa := whatsapp.New(cfg.WhatsAppAPIVersion, cfg.WhatsAppAccessToken)
 	psc := paystack.New(paystack.Config{SecretKey: cfg.PaystackSecretKey, BaseURL: cfg.PaystackBaseURL})
+	expoClient := expo.New(expo.Config{BaseURL: os.Getenv("EXPO_BASE_URL"), AccessToken: os.Getenv("EXPO_ACCESS_TOKEN")})
+
+	// Push notifications: deliver to vendor mobile devices.
+	workers.RegisterPush(server, workers.PushDeps{Pool: pool, Expo: expoClient})
 
 	// Inbound: webhook-processing persists the message and debounces the
 	// orchestrator run.
@@ -209,9 +214,11 @@ func main() {
 				{Queue: queue.QPaymentInit, TaskType: queue.TaskPaymentInit},
 				{Queue: queue.QCRMMaterialiser, TaskType: queue.TaskProfileStats},
 				{Queue: queue.QFollowUp, TaskType: queue.TaskFollowUpSchedule},
+				{Queue: queue.QPushNotifications, TaskType: queue.TaskPushOrderCreated},
 			},
 			events.TypeOrderCancelled: {
 				{Queue: queue.QCheckout, TaskType: queue.TaskRestock},
+				{Queue: queue.QPushNotifications, TaskType: queue.TaskPushOrderCancelled},
 			},
 		},
 	}

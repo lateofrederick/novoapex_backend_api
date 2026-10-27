@@ -19,13 +19,14 @@ const (
 	QPaymentEvents     = "payment-events"
 	QFollowUp          = "follow-up"
 	QEmbedding         = "embedding"
+	QPushNotifications = "push-notifications"
 	QExample           = "example-queue"
 )
 
 // AllQueues lists every queue the system declares (QueueProducerModule's
 // registerQueue list), so dashboards show them before their first job.
 func AllQueues() []string {
-	return []string{QExample, QOrchestrator, QOutbound, QCheckout, QPaymentInit, QWebhookProcessing, QCRMMaterialiser, QPaymentEvents, QFollowUp, QEmbedding}
+	return []string{QExample, QOrchestrator, QOutbound, QCheckout, QPaymentInit, QWebhookProcessing, QCRMMaterialiser, QPaymentEvents, QFollowUp, QEmbedding, QPushNotifications}
 }
 
 // Task types — mirror the Node job name for every enqueue site.
@@ -43,6 +44,9 @@ const (
 	TaskEmbedProductImage    = "embedding:embed-product-image"
 	TaskFollowUpRun          = "follow-up:run" // payload.job_type switches abandoned-cart/unpaid-invoice-first/unpaid-invoice-second/delivery-confirmation/re-engagement
 	TaskFollowUpSchedule     = "follow-up:schedule"
+	TaskPushSend             = "push-notifications:send"
+	TaskPushOrderCreated     = "push-notifications:order-created"
+	TaskPushOrderCancelled   = "push-notifications:order-cancelled"
 
 	// TaskExamplePrefix routes every job on example-queue, whatever its name
 	// ("example-queue:<name>"), to the example processor.

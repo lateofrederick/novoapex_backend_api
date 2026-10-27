@@ -336,10 +336,24 @@ func TestS7A_PaymentStrategyA_ReconcileConfirmCancelFollowUps(t *testing.T) {
 	}
 
 	calls := pub.recorded()
-	if len(calls) != 1 {
-		t.Fatalf("publisher calls = %d, want 1 (persist row THEN publish)", len(calls))
+	if len(calls) != 2 {
+		t.Fatalf("publisher calls = %d, want 2 (outbound send + push notification)", len(calls))
 	}
-	c := calls[0]
+	var outboundCall, pushCall *s7a_enqueueCall
+	for i := range calls {
+		if calls[i].Queue == queue.QOutbound {
+			outboundCall = &calls[i]
+		} else if calls[i].Queue == queue.QPushNotifications {
+			pushCall = &calls[i]
+		}
+	}
+	if outboundCall == nil {
+		t.Fatalf("missing outbound message call")
+	}
+	if pushCall == nil {
+		t.Fatalf("missing push notification call")
+	}
+	c := *outboundCall
 	if c.Queue != queue.QOutbound || c.TaskType != queue.TaskOutboundSend {
 		t.Errorf("enqueue target = %s/%s, want %s/%s", c.Queue, c.TaskType, queue.QOutbound, queue.TaskOutboundSend)
 	}
@@ -388,8 +402,8 @@ func TestS7A_PaymentDuplicateEvent_IsIdempotentSingleRow(t *testing.T) {
 	if got := s7a_count(t, s.db, `SELECT COUNT(*) FROM outbound_messages WHERE conversation_id = $1`, conv.ID); got != 1 {
 		t.Errorf("outbound rows after duplicate = %d, want 1", got)
 	}
-	if len(pub.recorded()) != 1 {
-		t.Errorf("publisher calls after duplicate = %d, want 1", len(pub.recorded()))
+	if len(pub.recorded()) != 2 {
+		t.Errorf("publisher calls after duplicate = %d, want 2 (outbound + push from first handle only)", len(pub.recorded()))
 	}
 }
 

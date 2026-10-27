@@ -55,6 +55,7 @@ var builtinPolicies = map[string]QueuePolicy{
 	QPaymentEvents:     {MaxRetry: 4, BackoffBase: 3 * time.Second, RateLimit: 20, RateWindow: 1 * time.Second},
 	QFollowUp:          {MaxRetry: 2, BackoffBase: 5 * time.Second, RateLimit: 10, RateWindow: 1 * time.Second},
 	QEmbedding:         {MaxRetry: 2, BackoffBase: 2 * time.Second},
+	QPushNotifications: {MaxRetry: 2, BackoffBase: 2 * time.Second, RateLimit: 100, RateWindow: 1 * time.Second},
 	QExample:           {MaxRetry: 0}, // registered without defaultJobOptions: BullMQ's single attempt
 }
 

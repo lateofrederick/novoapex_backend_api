@@ -302,6 +302,29 @@ func HandlePaymentEvent(ctx context.Context, deps Deps, evt paystack.NormalisedP
 		"status", status,
 		"reconciled", orderID != "")
 
+	if orderID != "" && evt.Status == "success" {
+		_ = EnqueuePush(ctx, deps.Publisher, PushJobPayload{
+			BusinessID: businessID,
+			Title:      "Payment Confirmed! 💰",
+			Body:       fmt.Sprintf("%s %s paid for order. Ready to fulfill.", evt.Currency, amountMajor.StringFixed(2)),
+			Sound:      "default",
+			ChannelID:  "orders",
+			Priority:   "high",
+			Data: map[string]any{
+				"type":     "ORDER_PAID",
+				"version":  "1.0",
+				"entityId": orderID,
+				"url":      "/orders/" + orderID,
+				"metadata": map[string]any{
+					"orderId":          orderID,
+					"amountPaid":       amountMajor.StringFixed(2),
+					"currency":         evt.Currency,
+					"paymentReference": evt.Reference,
+				},
+			},
+		})
+	}
+
 	// Payment-behaviour signal: remember how this customer actually pays.
 	// Latest successful payment wins — same policy as sentiment/delivery_area
 	// in ProfileBuilderHandler. Non-blocking: never let this fail the webhook.

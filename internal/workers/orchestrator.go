@@ -478,6 +478,24 @@ func orchEnforceSafetyGuardrails(ctx context.Context, deps OrchestratorDeps, oc 
 		if err := orchSetEscalated(ctx, deps.Pool, oc.conversationID, orchKeywordReason); err != nil {
 			return false, err
 		}
+		_ = EnqueuePush(ctx, deps.Publisher, PushJobPayload{
+			BusinessID: oc.businessID,
+			Title:      "Urgent: Customer Escalation 🚨",
+			Body:       "Customer flagged safety keyword. AI paused — tap to take over.",
+			Sound:      "default",
+			ChannelID:  "handoffs",
+			Priority:   "high",
+			Data: map[string]any{
+				"type":     "HANDOFF_ESCALATED",
+				"version":  "1.0",
+				"entityId": oc.conversationID,
+				"url":      "/inbox/" + oc.conversationID,
+				"metadata": map[string]any{
+					"conversationId": oc.conversationID,
+					"triggerReason":  "safety_keyword",
+				},
+			},
+		})
 		// :464-469 — connecting message goes through enqueueOutboundMessage,
 		// i.e. subject to the 24h window like every free-form reply.
 		if err := orchEnqueueOutboundText(ctx, deps, oc.businessID, oc.conversationID, orchConnectingMsg); err != nil {
@@ -624,6 +642,24 @@ func orchGenerateAndHandleLlmResponse(ctx context.Context, deps OrchestratorDeps
 		if err := orchSetEscalated(ctx, deps.Pool, oc.conversationID, orchLowConfReason); err != nil {
 			return err
 		}
+		_ = EnqueuePush(ctx, deps.Publisher, PushJobPayload{
+			BusinessID: oc.businessID,
+			Title:      "Human Support Requested 💬",
+			Body:       "AI assistant escalated conversation to human agent.",
+			Sound:      "default",
+			ChannelID:  "handoffs",
+			Priority:   "high",
+			Data: map[string]any{
+				"type":     "HANDOFF_REQUESTED",
+				"version":  "1.0",
+				"entityId": oc.conversationID,
+				"url":      "/inbox/" + oc.conversationID,
+				"metadata": map[string]any{
+					"conversationId": oc.conversationID,
+					"triggerReason":  "low_confidence",
+				},
+			},
+		})
 		return orchEnqueueOutboundText(ctx, deps, oc.businessID, oc.conversationID, orchConnectingMsg)
 	}
 
