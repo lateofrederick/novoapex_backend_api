@@ -316,6 +316,18 @@ type CustomerProfile struct {
 	PreferredPaymentNetwork pgtype.Text      `json:"preferred_payment_network"`
 }
 
+type DeviceToken struct {
+	ID            string           `json:"id"`
+	BusinessID    string           `json:"business_id"`
+	OwnerPhone    string           `json:"owner_phone"`
+	ExpoPushToken string           `json:"expo_push_token"`
+	Platform      string           `json:"platform"`
+	DeviceName    pgtype.Text      `json:"device_name"`
+	CreatedAt     pgtype.Timestamp `json:"created_at"`
+	UpdatedAt     pgtype.Timestamp `json:"updated_at"`
+	LastUsedAt    pgtype.Timestamp `json:"last_used_at"`
+}
+
 type DomainEvent struct {
 	ID            string           `json:"id"`
 	AggregateType string           `json:"aggregate_type"`
