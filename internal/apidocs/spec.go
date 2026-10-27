@@ -164,6 +164,7 @@ func tags() []obj {
 	return []obj{
 		{"name": "auth", "description": "OTP login and session"},
 		{"name": "businesses", "description": "Vendor onboarding"},
+		{"name": "devices", "description": "Push notification device tokens"},
 		{"name": "products", "description": "Catalog and product images"},
 		{"name": "locations", "description": "Physical shops (pickup/delivery)"},
 		{"name": "customers", "description": "Stealth CRM customers"},
@@ -213,6 +214,14 @@ func operations(opts Options) []operation {
 			description: "One business per owner phone. The existing session token gains access to business routes immediately.",
 			body:        jsonBody("CreateBusinessDto"),
 			responses:   responses("201", respJSON("Business created", "Business"), "400", errValidation, "401", errAuth, "409", respJSON("Business already exists for this phone number", "ErrorEnvelope"))},
+
+		// devices
+		{method: "post", path: "/devices/push-token", tag: "devices", summary: "Register an Expo push notification token",
+			body:      jsonBody("RegisterDeviceTokenDto"),
+			responses: vendor("200", "Registered device token", "DeviceToken", "400", errValidation)},
+		{method: "delete", path: "/devices/push-token", tag: "devices", summary: "Delete an Expo push notification token",
+			body:      jsonBody("DeleteDeviceTokenDto"),
+			responses: vendor("200", "Token removed", "SuccessResponse", "400", errValidation)},
 
 		// products
 		{method: "get", path: "/products", tag: "products", summary: "List products", params: pagination,

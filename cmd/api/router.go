@@ -153,6 +153,9 @@ func buildRouter(d routerDeps) (*httpx.Kernel, func() error, error) {
 			handlers.MountPayoutsWrite(pr, handlers.PayoutsWriteDeps{Pool: d.pool, Paystack: d.paystack})
 		})
 		v.Route("/businesses", func(b chi.Router) { handlers.MountBusinesses(b, handlers.BusinessesDeps{Pool: d.pool}) })
+		v.Route("/devices", func(dr chi.Router) {
+			handlers.MountDevices(dr, handlers.DevicesDeps{Pool: d.pool})
+		})
 		v.Route("/locations", func(l chi.Router) {
 			l.Mount("/", handlers.NewLocations(d.pool))
 			handlers.MountLocationsWrite(l, handlers.LocationsWriteDeps{Pool: d.pool})

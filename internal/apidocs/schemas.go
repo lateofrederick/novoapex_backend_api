@@ -284,5 +284,24 @@ func schemas() obj {
 	})
 	s["PayoutBalance"] = object(obj{"totalRevenue": money(), "committedPayouts": money(), "availableBalance": money(), "currency": str()})
 	s["SendMessageResponse"] = object(obj{"success": obj{"type": "boolean", "example": true}, "data": obj{"type": "object", "description": "Meta Cloud API response"}})
+
+	// devices
+	s["RegisterDeviceTokenDto"] = input([]string{"token", "platform"}, obj{
+		"token":      str(),
+		"platform":   enum("ios", "android", "web"),
+		"deviceName": nstr(),
+	})
+	s["DeleteDeviceTokenDto"] = input([]string{"token"}, obj{
+		"token": str(),
+	})
+	s["DeviceToken"] = object(obj{
+		"id":            str(),
+		"businessId":    str(),
+		"expoPushToken": str(),
+		"platform":      str(),
+		"deviceName":    nstr(),
+		"updatedAt":     dt(),
+	})
+
 	return s
 }
