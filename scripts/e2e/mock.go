@@ -34,6 +34,7 @@ type providerMock struct {
 
 	sentry      []sentryItem // envelope items received by the Sentry ingest
 	metaTraceID []string     // trace ids propagated on Meta sends (sentry-trace)
+	pushes      []pushMessage
 }
 
 // sentryItem is one envelope item: an error "event", a "transaction", its
@@ -42,6 +43,18 @@ type sentryItem struct {
 	EventID string
 	Type    string
 	Payload map[string]any
+}
+
+type pushMessage struct {
+	To        string         `json:"to"`
+	Title     string         `json:"title"`
+	Subtitle  string         `json:"subtitle"`
+	Body      string         `json:"body"`
+	Sound     string         `json:"sound"`
+	Badge     int            `json:"badge"`
+	ChannelID string         `json:"channelId"`
+	Priority  string         `json:"priority"`
+	Data      map[string]any `json:"data"`
 }
 
 type waMessage struct {
@@ -78,6 +91,7 @@ func startMock() (*providerMock, error) {
 	mux.HandleFunc("/cloudinary/", m.cloudinary)
 	mux.HandleFunc("/img/", m.imageFile)
 	mux.HandleFunc("/sentry/api/1/envelope/", m.sentryEnvelope)
+	mux.HandleFunc("/--/api/v2/push/send", m.expoPush)
 	go func() { _ = http.Serve(ln, mux) }()
 	return m, nil
 }
@@ -465,4 +479,40 @@ func testJPEG(c color.Color) []byte {
 	var buf bytes.Buffer
 	_ = jpeg.Encode(&buf, img, nil)
 	return buf.Bytes()
+}
+
+// --- Expo Push ------------------------------------------------------------------
+
+func (m *providerMock) expoPush(w http.ResponseWriter, r *http.Request) {
+	m.count("expo-push")
+
+	var messages []pushMessage
+	if err := json.NewDecoder(r.Body).Decode(&messages); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
+		return
+	}
+	m.mu.Lock()
+	m.pushes = append(m.pushes, messages...)
+	count := len(m.pushes)
+	m.mu.Unlock()
+
+	tickets := make([]map[string]any, len(messages))
+	for i := range messages {
+		tickets[i] = map[string]any{
+			"status": "ok",
+			"id":     fmt.Sprintf("ticket-e2e-%d", count+i),
+		}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"data": tickets})
+}
+
+func (m *providerMock) findPushByType(eventType string) (pushMessage, bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for _, p := range m.pushes {
+		if t, _ := p.Data["type"].(string); t == eventType {
+			return p, true
+		}
+	}
+	return pushMessage{}, false
 }

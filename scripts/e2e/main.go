@@ -214,6 +214,10 @@ func (r *runner) scenario() {
 	code, body = r.do("POST", "/locations", map[string]any{"name": "Osu Shop", "address": "12 Oxford St", "openingTime": "08:00", "closingTime": "18:00"}, r.token)
 	r.check("POST /locations", code == 201 && jsonString(body, "id") != "", body)
 
+	pushToken := "ExponentPushToken[e2e-vendor-device]"
+	code, body = r.do("POST", "/devices/push-token", map[string]any{"token": pushToken, "platform": "ios", "deviceName": "Ama's iPhone"}, r.token)
+	r.check("POST /devices/push-token registers device push token", code == 200 && strings.Contains(body, pushToken), body)
+
 	r.section("Catalog + embeddings")
 	code, body = r.do("POST", "/products", map[string]any{"name": "Shea Butter", "description": "Raw unrefined shea", "price": 45, "stock": 10, "category": "skin care"}, r.token)
 	productID := jsonString(body, "id")
@@ -301,6 +305,10 @@ func (r *runner) scenario() {
 		return r.scalar(`SELECT c.name || '|' || p.delivery_area || '|' || c.marketing_opt_in || '|' || p.total_orders || '|' || p.total_spent
 			FROM customers c JOIN customer_profiles p ON p.customer_id = c.id WHERE c.phone = $1`, customerPhone) == "Ama Mensah|East Legon|true|1|90.00"
 	}))
+	r.check("ORDER_CREATED push notification dispatched to vendor", r.waitFor(15*time.Second, func() bool {
+		p, ok := r.mock.findPushByType("ORDER_CREATED")
+		return ok && p.To == pushToken && p.Data["entityId"] == orderID
+	}))
 
 	r.section("Payments")
 	sentBefore = len(r.mock.messagesTo(customerPhone))
@@ -328,6 +336,10 @@ func (r *runner) scenario() {
 		return false
 	}))
 	r.check("preferred payment network recorded", r.scalar(`SELECT p.preferred_payment_network FROM customer_profiles p JOIN customers c ON c.id = p.customer_id WHERE c.phone = $1`, customerPhone) == "MTN")
+	r.check("ORDER_PAID push notification dispatched to vendor", r.waitFor(15*time.Second, func() bool {
+		p, ok := r.mock.findPushByType("ORDER_PAID")
+		return ok && p.To == pushToken && p.Data["entityId"] == orderID
+	}))
 
 	r.section("Vendor app reads")
 	for _, path := range []string{"/orders", "/orders/" + orderID, "/orders/summary", "/customers", "/customers/summary", "/inbox/summary", "/inbox/handoffs",
@@ -434,6 +446,14 @@ func (r *runner) scenario() {
 		return false
 	}) && r.mock.callCount("llm") == llmBefore)
 	r.check("escalation reason recorded", r.scalar(`SELECT is_escalated_to_human || ' ' || escalation_reason FROM conversations WHERE customer_phone = $1`, customer2Phone) == "true KEYWORD_MATCH")
+	r.check("HANDOFF_ESCALATED push notification dispatched to vendor", r.waitFor(15*time.Second, func() bool {
+		p, ok := r.mock.findPushByType("HANDOFF_ESCALATED")
+		return ok && p.To == pushToken && p.Data["metadata"].(map[string]any)["triggerReason"] == "safety_keyword"
+	}))
+
+	code, body = r.do("DELETE", "/devices/push-token", map[string]any{"token": pushToken}, r.token)
+	r.check("DELETE /devices/push-token removes vendor device token", code == 200 && strings.Contains(body, `"success":true`))
+	r.check("device_tokens table has 0 rows for business", r.scalar(`SELECT count(*) FROM device_tokens WHERE business_id = $1`, businessID) == "0")
 
 	r.section("Outbox recovery, retention, new arrivals (crons)")
 	// A quiet conversation (no newer sends) gets its stranded row delivered;
@@ -756,6 +776,7 @@ func serviceEnv(dsn, redisAddr, redisPass, mockURL string) []string {
 		"GOOGLE_GENERATIVE_AI_BASE_URL="+mockURL+"/google",
 		"PAYSTACK_SECRET_KEY="+paystackSecret,
 		"PAYSTACK_BASE_URL="+mockURL+"/paystack",
+		"EXPO_BASE_URL="+mockURL,
 		"CLOUDINARY_CLOUD_NAME=e2e-cloud", "CLOUDINARY_API_KEY=key", "CLOUDINARY_API_SECRET=secret",
 		"CLOUDINARY_BASE_URL="+mockURL+"/cloudinary",
 		"ENABLE_SWAGGER=true",
