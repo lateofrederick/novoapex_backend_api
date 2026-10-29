@@ -507,10 +507,10 @@ func orchEnforceSafetyGuardrails(ctx context.Context, deps OrchestratorDeps, oc 
 }
 
 // orchFetchConversationHistory ports fetchConversationHistory (:477-509):
-// last 10 inbound (by timestamp desc) + last 10 outbound (by createdAt desc),
-// merged sorted ascending, sliced to the last 10, THEN empty-filtered (an
-// empty message inside the newest ten still burns its budget slot), mapped to
-// single-text-part chat messages.
+// last 10 inbound (by timestamp desc) + last 10 outbound (by createdAt desc)
+// within the active 24h window, merged sorted ascending, sliced to the last 10,
+// THEN empty-filtered (an empty message inside the newest ten still burns its
+// budget slot), mapped to single-text-part chat messages.
 func orchFetchConversationHistory(ctx context.Context, pool *pgxpool.Pool, conversationID string) ([]orchestrator.ChatMessage, error) {
 	type item struct {
 		role    string
@@ -518,10 +518,13 @@ func orchFetchConversationHistory(ctx context.Context, pool *pgxpool.Pool, conve
 		at      int64
 	}
 
+	since := time.Now().UTC().Add(-orch24hWindow)
+
 	inRows, err := pool.Query(ctx,
 		`SELECT COALESCE(text_content,''), "timestamp" FROM inbound_messages
-		 WHERE conversation_id = $1 ORDER BY "timestamp" DESC LIMIT $2`,
-		conversationID, orchHistoryPerSide)
+		 WHERE conversation_id = $1 AND "timestamp" >= $2
+		 ORDER BY "timestamp" DESC LIMIT $3`,
+		conversationID, since, orchHistoryPerSide)
 	if err != nil {
 		return nil, fmt.Errorf("orchestrator: inbound history: %w", err)
 	}
@@ -542,8 +545,9 @@ func orchFetchConversationHistory(ctx context.Context, pool *pgxpool.Pool, conve
 
 	outRows, err := pool.Query(ctx,
 		`SELECT COALESCE(text_content,''), created_at FROM outbound_messages
-		 WHERE conversation_id = $1 ORDER BY created_at DESC LIMIT $2`,
-		conversationID, orchHistoryPerSide)
+		 WHERE conversation_id = $1 AND created_at >= $2
+		 ORDER BY created_at DESC LIMIT $3`,
+		conversationID, since, orchHistoryPerSide)
 	if err != nil {
 		return nil, fmt.Errorf("orchestrator: outbound history: %w", err)
 	}

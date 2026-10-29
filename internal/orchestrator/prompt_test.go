@@ -31,6 +31,7 @@ func TestSystemPromptAnchorsVerbatim(t *testing.T) {
 		"1. ONLY reference products listed in the CATALOG section below. NEVER invent products, prices, or availability.",
 		"2. When recommending a product, always include its price and ID (e.g. \"[ID: abc123]\").",
 		"5. Products without stock information are available. Only say \"out of stock\" if the catalog explicitly shows 0 stock.",
+		"6. The CATALOG section is the live, single source of truth for all product prices and availability.",
 
 		orchestrator.SectionProductImageRules,
 		"1. TEXT FIRST. When the customer asks what you have, browses, or asks about a product, answer with the product LIST as text (name, price, ID). Do NOT attach images to that reply.",

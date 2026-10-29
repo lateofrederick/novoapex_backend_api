@@ -739,6 +739,57 @@ func TestOpipeHistoryMergeSortFilterSlice(t *testing.T) {
 	}
 }
 
+func TestOpipeHistoryExcludesOlderThan24h(t *testing.T) {
+	e := opipeStart(t)
+	biz := e.factory.Business()
+	sender := biz.OwnerPhone
+
+	oc, ok, err := workers.ResolveConversationContext(context.Background(), e.pool, biz.WhatsAppPhoneNumberID, sender)
+	if err != nil || !ok {
+		t.Fatalf("resolve context: ok=%v err=%v", ok, err)
+	}
+
+	insertInbound := func(text string, at time.Time) {
+		raw, _ := json.Marshal(map[string]any{"type": "text"})
+		if _, err := e.db.Exec(`INSERT INTO inbound_messages
+			(id, whatsapp_message_id, sender_phone, recipient_phone, message_type, text_content, raw_payload, "timestamp", business_id, conversation_id, created_at)
+			VALUES ($1,$1,$2,$3,'text',NULLIF($4,''),$5,$6,$7,$8,$6)`,
+			fmt.Sprintf("in-%d", at.UnixNano()), sender, biz.WhatsAppPhoneNumberID, text, raw, at, biz.ID, oc.ConversationID); err != nil {
+			t.Fatal(err)
+		}
+	}
+	insertOutbound := func(text string, at time.Time) {
+		raw, _ := json.Marshal(map[string]any{})
+		if _, err := e.db.Exec(`INSERT INTO outbound_messages
+			(id, recipient_phone, message_type, text_content, raw_payload, status, business_id, conversation_id, created_at)
+			VALUES ($1,$2,'text',$3,$4,'sent',$5,$6,$7)`,
+			fmt.Sprintf("out-%d", at.UnixNano()), sender, text, raw, biz.ID, oc.ConversationID, at); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// Message from 2 days ago (must be excluded)
+	insertInbound("old user message", time.Now().Add(-48*time.Hour))
+	insertOutbound("old assistant message", time.Now().Add(-48*time.Hour))
+
+	// Message from 2 hours ago (must be included)
+	insertInbound("recent message", time.Now().Add(-2*time.Hour))
+
+	e.llm.steps = []orchestrator.LlmResponse{opipeResp(nil)}
+	opipeRun(t, e, biz, sender)
+
+	if calls := e.llm.callCount(); calls != 1 {
+		t.Fatalf("llm calls = %d, want 1", calls)
+	}
+	msgs := e.llm.calls[0].Messages
+	if len(msgs) != 1 {
+		t.Fatalf("history length = %d (%v), want 1 (older than 24h excluded)", len(msgs), msgs)
+	}
+	if msgs[0].Parts[0].Text != "recent message" {
+		t.Errorf("history message text = %q, want 'recent message'", msgs[0].Parts[0].Text)
+	}
+}
+
 // ---------------------------------------------------------------------------
 // T8.18 — context resolution upsert idempotency + orphan backfill
 // ---------------------------------------------------------------------------
