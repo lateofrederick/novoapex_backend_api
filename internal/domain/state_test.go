@@ -23,13 +23,13 @@ import (
 // plus the Go-side PAID/CANCELLED extension for the event-driven checkout
 // lifecycle. Kept here (not derived) so a drift in either direction fails loud.
 var s7bExpectedTransitions = map[ConversationState][]ConversationState{
-	StateLead:      {StateBrowsing, StateCheckout, StateSupport, StateEscalated},
+	StateLead:      {StateBrowsing, StateCheckout, StateSupport, StateInvoicing, StateEscalated},
 	StateBrowsing:  {StateCheckout, StateSupport, StateInvoicing, StateEscalated},
 	StateCheckout:  {StateInvoicing, StateSupport, StateEscalated},
 	StateInvoicing: {StatePaid, StateCancelled, StateSupport, StateEscalated},
 	StatePaid:      {StateBrowsing, StateSupport, StateEscalated},
 	StateCancelled: {StateBrowsing, StateSupport, StateEscalated},
-	StateSupport:   {StateBrowsing, StateLead, StateEscalated},
+	StateSupport:   {StateBrowsing, StateCheckout, StateInvoicing, StateLead, StateEscalated},
 	StateEscalated: {}, // terminal
 }
 
@@ -94,9 +94,9 @@ func s7bStatemachineRows() []s7bSTMRow {
 		{from: StateBrowsing, attempt: StateSupport, toWant: StateSupport, class: "legal-edge", success: true},
 		{from: StateBrowsing, attempt: StateInvoicing, toWant: StateInvoicing, class: "legal-edge", success: true},
 		{from: StateCheckout, attempt: StateInvoicing, toWant: StateInvoicing, class: "legal-edge", success: true},
-		// Table rejects: pipeline wants INVOICING but LEAD/SUPPORT have no edge to it.
-		{from: StateLead, attempt: StateInvoicing, toWant: StateLead, class: "table-rejects"},
-		{from: StateSupport, attempt: StateInvoicing, toWant: StateSupport, class: "table-rejects"},
+		// Table rejects: pipeline wants INVOICING but PAID/CANCELLED have no edge to it.
+		{from: StatePaid, attempt: StateInvoicing, toWant: StatePaid, class: "table-rejects"},
+		{from: StateCancelled, attempt: StateInvoicing, toWant: StateCancelled, class: "table-rejects"},
 		// Orchestrator guard blocks the LLM flow before any transition attempt.
 		{from: StateCheckout, toWant: StateCheckout, class: "guard-blocked"},
 		{from: StateInvoicing, toWant: StateInvoicing, class: "guard-blocked"},

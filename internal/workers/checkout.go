@@ -49,7 +49,7 @@ type CheckoutDeps struct {
 }
 
 // errCheckoutNotOrderable is a non-fatal rejection: the conversation is not in
-// an orderable state (BROWSING/CHECKOUT) — already invoicing, or a race — so
+// an orderable state (BROWSING/CHECKOUT/SUPPORT/LEAD) — already invoicing, or a race — so
 // no order may be created.
 var errCheckoutNotOrderable = errors.New("checkout: conversation is not in an orderable state")
 
@@ -124,7 +124,7 @@ func HandleCheckout(ctx context.Context, deps CheckoutDeps, job CheckoutJob) err
 		tq := gen.New(tx)
 
 		ok, terr := domain.TransitionToTx(ctx, tx, job.ConversationID,
-			[]domain.ConversationState{domain.StateBrowsing, domain.StateCheckout},
+			[]domain.ConversationState{domain.StateBrowsing, domain.StateCheckout, domain.StateSupport, domain.StateLead},
 			domain.StateInvoicing)
 		if terr != nil {
 			return terr
@@ -214,8 +214,11 @@ func HandleCheckout(ctx context.Context, deps CheckoutDeps, job CheckoutJob) err
 	case txErr == nil:
 		// committed
 	case errors.Is(txErr, errCheckoutNotOrderable):
+		var currentState string
+		_ = deps.Pool.QueryRow(ctx, `SELECT state::text FROM conversations WHERE id = $1`, job.ConversationID).Scan(&currentState)
 		slog.Warn("Checkout skipped — conversation not in an orderable state",
-			"conversationId", job.ConversationID)
+			"conversationId", job.ConversationID,
+			"currentState", currentState)
 		return nil
 	case checkoutDuplicateIdempotency(txErr):
 		slog.Warn("Checkout skipped — duplicate idempotency key",

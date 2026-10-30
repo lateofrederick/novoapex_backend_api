@@ -686,7 +686,7 @@ func orchGenerateAndHandleLlmResponse(ctx context.Context, deps OrchestratorDeps
 	switch {
 	case resp.Intent == "checkout_request": // (:597-601)
 		switch current {
-		case domain.StateLead, domain.StateBrowsing:
+		case domain.StateLead, domain.StateBrowsing, domain.StateSupport:
 			newState, hasNew = domain.StateCheckout, true
 		case domain.StatePaid, domain.StateCancelled:
 			// Reorder: a completed/cancelled customer restarts at BROWSING
@@ -695,12 +695,12 @@ func orchGenerateAndHandleLlmResponse(ctx context.Context, deps OrchestratorDeps
 		}
 	case resp.Intent == "product_inquiry" || resp.Intent == "image_match": // (:602-605)
 		switch current {
-		case domain.StateLead, domain.StatePaid, domain.StateCancelled:
+		case domain.StateLead, domain.StateSupport, domain.StatePaid, domain.StateCancelled:
 			newState, hasNew = domain.StateBrowsing, true
 		}
 	case resp.Intent == "support_faq" || resp.Intent == "complaint": // (:606-610)
 		switch current {
-		case domain.StateLead, domain.StateBrowsing, domain.StatePaid, domain.StateCancelled:
+		case domain.StateLead, domain.StateBrowsing, domain.StateCheckout, domain.StatePaid, domain.StateCancelled:
 			newState, hasNew = domain.StateSupport, true
 		}
 	}

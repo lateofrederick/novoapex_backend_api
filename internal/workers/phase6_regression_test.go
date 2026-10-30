@@ -102,3 +102,48 @@ func TestOutboxAtomicity_NoOrphanOrderOrEvent(t *testing.T) {
 		t.Fatalf("order.created events after rollback = %d, want 0 (no orphan event)", got)
 	}
 }
+
+// Regression: A conversation in SUPPORT or LEAD state must be allowed to checkout.
+// If a customer was asking support/FAQ questions before confirming an order,
+// the checkout job must successfully transition the conversation to INVOICING
+// and generate the order and outbox event.
+func TestRegression_CheckoutFromSupportOrLeadStateSucceeds(t *testing.T) {
+	env = s7bNewEnv(t)
+
+	biz := env.dbw.factory.Business()
+	prod := env.dbw.factory.Product(biz.ID, harness.WithStock(10), harness.WithPrice("50.00"))
+
+	// 1. Conversation in SUPPORT state
+	custSupport := env.dbw.factory.Customer(biz.ID)
+	convSupport := env.dbw.factory.Conversation(biz.ID, custSupport.Phone, harness.WithLinkedCustomer(custSupport.ID), harness.WithState("SUPPORT"))
+
+	s7bRunCheckout(t, s7bCheckoutJob(biz.ID, custSupport.ID, convSupport.ID, custSupport.Phone, "wamid.supp-1",
+		[]workers.DetectedItem{{ProductID: prod.ID[:8], Quantity: 1}}))
+
+	if got := s7bScalarInt(t, `SELECT COUNT(*) FROM orders WHERE conversation_id = $1`, convSupport.ID); got != 1 {
+		t.Fatalf("orders for SUPPORT conversation = %d, want 1", got)
+	}
+	if state := s7bScalarString(t, `SELECT state::text FROM conversations WHERE id = $1`, convSupport.ID); state != "INVOICING" {
+		t.Fatalf("conversation state = %s, want INVOICING", state)
+	}
+	if got := s7bScalarInt(t, `SELECT COUNT(*) FROM domain_events WHERE event_type = 'order.created' AND payload->>'conversationId' = $1`, convSupport.ID); got != 1 {
+		t.Fatalf("order.created events for SUPPORT conversation = %d, want 1", got)
+	}
+
+	// 2. Conversation in LEAD state
+	custLead := env.dbw.factory.Customer(biz.ID)
+	convLead := env.dbw.factory.Conversation(biz.ID, custLead.Phone, harness.WithLinkedCustomer(custLead.ID), harness.WithState("LEAD"))
+
+	s7bRunCheckout(t, s7bCheckoutJob(biz.ID, custLead.ID, convLead.ID, custLead.Phone, "wamid.lead-1",
+		[]workers.DetectedItem{{ProductID: prod.ID[:8], Quantity: 1}}))
+
+	if got := s7bScalarInt(t, `SELECT COUNT(*) FROM orders WHERE conversation_id = $1`, convLead.ID); got != 1 {
+		t.Fatalf("orders for LEAD conversation = %d, want 1", got)
+	}
+	if state := s7bScalarString(t, `SELECT state::text FROM conversations WHERE id = $1`, convLead.ID); state != "INVOICING" {
+		t.Fatalf("conversation state = %s, want INVOICING", state)
+	}
+	if got := s7bScalarInt(t, `SELECT COUNT(*) FROM domain_events WHERE event_type = 'order.created' AND payload->>'conversationId' = $1`, convLead.ID); got != 1 {
+		t.Fatalf("order.created events for LEAD conversation = %d, want 1", got)
+	}
+}

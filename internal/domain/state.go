@@ -36,16 +36,17 @@ const (
 //
 // Go-side extension (not part of the TS source): PAID and CANCELLED close the
 // checkout loop. INVOICING reaches them on payment success/failure; both reset
-// to BROWSING for an explicit reorder. Order creation remains legal only from
-// CHECKOUT, which preserves the one-order-at-a-time invariant.
+// to BROWSING for an explicit reorder. Order creation is legal only from pre-order
+// states (BROWSING, CHECKOUT, SUPPORT, LEAD), which preserves the one-order-at-a-time
+// invariant by rejecting orders when a conversation is already in INVOICING or PAID.
 var ValidTransitions = map[ConversationState][]ConversationState{
-	StateLead:      {StateBrowsing, StateCheckout, StateSupport, StateEscalated},
+	StateLead:      {StateBrowsing, StateCheckout, StateSupport, StateInvoicing, StateEscalated},
 	StateBrowsing:  {StateCheckout, StateSupport, StateInvoicing, StateEscalated},
 	StateCheckout:  {StateInvoicing, StateSupport, StateEscalated},
 	StateInvoicing: {StatePaid, StateCancelled, StateSupport, StateEscalated},
 	StatePaid:      {StateBrowsing, StateSupport, StateEscalated},
 	StateCancelled: {StateBrowsing, StateSupport, StateEscalated},
-	StateSupport:   {StateBrowsing, StateLead, StateEscalated},
+	StateSupport:   {StateBrowsing, StateCheckout, StateInvoicing, StateLead, StateEscalated},
 	StateEscalated: {}, // terminal
 }
 
