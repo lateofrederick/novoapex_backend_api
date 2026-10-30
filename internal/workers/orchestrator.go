@@ -35,7 +35,9 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/shopspring/decimal"
 
+	"github.com/novoapex/novoapex-backend-api/internal/db/gen"
 	"github.com/novoapex/novoapex-backend-api/internal/domain"
 	"github.com/novoapex/novoapex-backend-api/internal/orchestrator"
 	"github.com/novoapex/novoapex-backend-api/internal/queue"
@@ -727,9 +729,99 @@ func orchGenerateAndHandleLlmResponse(ctx context.Context, deps OrchestratorDeps
 	// pipeline (order + state flip + order.created), which owns the
 	// CHECKOUT -> INVOICING transition and the one-order-at-a-time guard.
 	if resp.CrmSignals.OrderConfirmed && len(resp.CrmSignals.DetectedItems) > 0 {
-		checkoutJob := orchCheckoutJob(oc, latest, resp)
-		if err := deps.Publisher.Enqueue(ctx, queue.QCheckout, queue.TaskCheckout, checkoutJob, nil); err != nil {
-			slog.Warn("Failed to emit checkout job (non-blocking)", "err", err)
+		// INVARIANT: An order cannot be confirmed from a PAID or INVOICING conversation in the same turn.
+		// A completed or awaiting-payment customer saying "Great!!" or "Okay" must not create an order.
+		if oc.state == domain.StatePaid || oc.state == domain.StateInvoicing {
+			slog.Warn("Ignoring order_confirmed signal on post-order state",
+				"conversationId", oc.conversationID,
+				"currentState", oc.state)
+		} else {
+			q := gen.New(deps.Pool)
+			var orderIntentID *string
+
+			// Check for an active order intent awaiting confirmation
+			activeIntent, err := q.GetActiveOrderIntent(ctx, oc.conversationID)
+			if err == nil {
+				orderIntentID = &activeIntent.ID
+			} else if !errors.Is(err, pgx.ErrNoRows) {
+				slog.Error("Failed to check active order intent", "err", err, "conversationId", oc.conversationID)
+			}
+
+			// If no active intent was staged previously, stage one now if this was a valid pre-order state
+			if orderIntentID == nil {
+				intentID := uuid.NewString()
+				fulfillment := gen.FulfillmentTypeDELIVERY
+				if resp.CrmSignals.FulfillmentChoice != nil && *resp.CrmSignals.FulfillmentChoice == "pickup" {
+					fulfillment = gen.FulfillmentTypePICKUP
+				}
+				var locID pgtype.Text
+				if resp.CrmSignals.PickupLocationID != nil {
+					locID = pgtype.Text{String: *resp.CrmSignals.PickupLocationID, Valid: true}
+				}
+				itemsJSON, _ := json.Marshal(resp.CrmSignals.DetectedItems)
+				source := ""
+				if latest != nil {
+					source = latest.whatsappID
+				}
+				staged, serr := q.StageOrderIntent(ctx, gen.StageOrderIntentParams{
+					ID:              intentID,
+					BusinessID:      oc.businessID,
+					CustomerID:      oc.customerID,
+					ConversationID:  oc.conversationID,
+					TotalAmount:     decimal.Zero, // finalized by checkout resolution
+					Currency:        oc.currency,
+					FulfillmentType: fulfillment,
+					LocationID:      locID,
+					DeliveryAddress: pgtype.Text{},
+					Items:           itemsJSON,
+					SourceMessageID: crmText(source),
+					ExpiresAt:       pgtype.Timestamp{Time: time.Now().UTC().Add(15 * time.Minute), Valid: true},
+				})
+				if serr == nil {
+					orderIntentID = &staged.ID
+				}
+			}
+
+			checkoutJob := orchCheckoutJob(oc, latest, resp)
+			checkoutJob.OrderIntentID = orderIntentID
+			if err := deps.Publisher.Enqueue(ctx, queue.QCheckout, queue.TaskCheckout, checkoutJob, nil); err != nil {
+				slog.Warn("Failed to emit checkout job (non-blocking)", "err", err)
+			}
+		}
+	} else if !resp.CrmSignals.OrderConfirmed && len(resp.CrmSignals.DetectedItems) > 0 &&
+		(oc.state == domain.StateBrowsing || oc.state == domain.StateCheckout || oc.state == domain.StateSupport || oc.state == domain.StateLead) {
+		// Staging turn: customer has items detected and bot is discussing or summarizing order details.
+		// Stage or update the order_intent with 15-minute expiry so subsequent confirmation is valid.
+		q := gen.New(deps.Pool)
+		intentID := uuid.NewString()
+		fulfillment := gen.FulfillmentTypeDELIVERY
+		if resp.CrmSignals.FulfillmentChoice != nil && *resp.CrmSignals.FulfillmentChoice == "pickup" {
+			fulfillment = gen.FulfillmentTypePICKUP
+		}
+		var locID pgtype.Text
+		if resp.CrmSignals.PickupLocationID != nil {
+			locID = pgtype.Text{String: *resp.CrmSignals.PickupLocationID, Valid: true}
+		}
+		itemsJSON, _ := json.Marshal(resp.CrmSignals.DetectedItems)
+		source := ""
+		if latest != nil {
+			source = latest.whatsappID
+		}
+		if _, serr := q.StageOrderIntent(ctx, gen.StageOrderIntentParams{
+			ID:              intentID,
+			BusinessID:      oc.businessID,
+			CustomerID:      oc.customerID,
+			ConversationID:  oc.conversationID,
+			TotalAmount:     decimal.Zero,
+			Currency:        oc.currency,
+			FulfillmentType: fulfillment,
+			LocationID:      locID,
+			DeliveryAddress: pgtype.Text{},
+			Items:           itemsJSON,
+			SourceMessageID: crmText(source),
+			ExpiresAt:       pgtype.Timestamp{Time: time.Now().UTC().Add(15 * time.Minute), Valid: true},
+		}); serr != nil {
+			slog.Warn("Failed to stage order intent (non-blocking)", "err", serr)
 		}
 	}
 	return nil

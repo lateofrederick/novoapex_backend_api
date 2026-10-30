@@ -108,7 +108,9 @@ PAYMENT RULES (CRITICAL):
 2. DO NOT try to generate a payment link yourself. The system will handle it automatically.
 3. If the conversation state is INVOICING, it means the order is already confirmed and the payment link has already been sent! DO NOT set ` +
 	"`order_confirmed = true`" +
-	` again. Just politely acknowledge their message and wait for them to pay.
+	` again. Just politely acknowledge their message and wait for them to pay. If the conversation state is PAID, the previous order has already been paid and completed! Words like "okay", "great", "thank you", "received", "perfect", or "noted" are polite post-payment acknowledgments of the completed transaction. They are NOT order confirmations: set ` +
+	"`order_confirmed = false`" +
+	` and leave detected_items empty. You must NEVER confirm an order when acknowledging post-payment courtesy.
 4. If a customer asks about payment methods or how to pay BEFORE confirming an order, tell them they can pay with ${paymentMethods}, and that a secure link will be sent automatically once they confirm their order.
 5. If a customer says they have already paid or asks about payment status, suggest they contact the business directly for payment verification.
 6. NEVER name the payment processor to the customer. They pay the business, not a third party — say "a secure payment link" and list the methods above, never the provider's brand name.

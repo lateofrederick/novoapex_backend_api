@@ -39,6 +39,7 @@ type CheckoutJob struct {
 	DetectedItems     []DetectedItem `json:"detectedItems"`
 	FulfillmentChoice *string        `json:"fulfillmentChoice,omitempty"`
 	PickupLocationID  *string        `json:"pickupLocationId,omitempty"`
+	OrderIntentID     *string        `json:"orderIntentId,omitempty"`
 }
 
 // CheckoutDeps carries everything order creation touches. Unlike the CRM
@@ -145,6 +146,15 @@ func HandleCheckout(ctx context.Context, deps CheckoutDeps, job CheckoutJob) err
 			LocationID:      locationID,
 		}); ierr != nil {
 			return ierr
+		}
+
+		if job.OrderIntentID != nil && *job.OrderIntentID != "" {
+			if _, cerr := tq.ConvertOrderIntent(ctx, gen.ConvertOrderIntentParams{
+				ID:      *job.OrderIntentID,
+				OrderID: crmText(orderID),
+			}); cerr != nil {
+				return fmt.Errorf("checkout: convert order intent %s: %w", *job.OrderIntentID, cerr)
+			}
 		}
 
 		items := make([]checkoutOrderItemRow, len(resolved))

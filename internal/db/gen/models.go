@@ -146,6 +146,51 @@ func (ns NullFulfillmentType) Value() (driver.Value, error) {
 	return string(ns.FulfillmentType), nil
 }
 
+type OrderIntentStatus string
+
+const (
+	OrderIntentStatusAWAITINGCONFIRMATION OrderIntentStatus = "AWAITING_CONFIRMATION"
+	OrderIntentStatusCONFIRMED            OrderIntentStatus = "CONFIRMED"
+	OrderIntentStatusCONVERTED            OrderIntentStatus = "CONVERTED"
+	OrderIntentStatusEXPIRED              OrderIntentStatus = "EXPIRED"
+	OrderIntentStatusCANCELLED            OrderIntentStatus = "CANCELLED"
+)
+
+func (e *OrderIntentStatus) Scan(src interface{}) error {
+	switch s := src.(type) {
+	case []byte:
+		*e = OrderIntentStatus(s)
+	case string:
+		*e = OrderIntentStatus(s)
+	default:
+		return fmt.Errorf("unsupported scan type for OrderIntentStatus: %T", src)
+	}
+	return nil
+}
+
+type NullOrderIntentStatus struct {
+	OrderIntentStatus OrderIntentStatus `json:"OrderIntentStatus"`
+	Valid             bool              `json:"valid"` // Valid is true if OrderIntentStatus is not NULL
+}
+
+// Scan implements the Scanner interface.
+func (ns *NullOrderIntentStatus) Scan(value interface{}) error {
+	if value == nil {
+		ns.OrderIntentStatus, ns.Valid = "", false
+		return nil
+	}
+	ns.Valid = true
+	return ns.OrderIntentStatus.Scan(value)
+}
+
+// Value implements the driver Valuer interface.
+func (ns NullOrderIntentStatus) Value() (driver.Value, error) {
+	if !ns.Valid {
+		return nil, nil
+	}
+	return string(ns.OrderIntentStatus), nil
+}
+
 type OrderStatus string
 
 const (
@@ -382,6 +427,25 @@ type Order struct {
 	PaymentUrl      pgtype.Text      `json:"payment_url"`
 	StatsRecordedAt pgtype.Timestamp `json:"stats_recorded_at"`
 	StockRestoredAt pgtype.Timestamp `json:"stock_restored_at"`
+}
+
+type OrderIntent struct {
+	ID              string            `json:"id"`
+	BusinessID      string            `json:"business_id"`
+	CustomerID      string            `json:"customer_id"`
+	ConversationID  string            `json:"conversation_id"`
+	Status          OrderIntentStatus `json:"status"`
+	TotalAmount     decimal.Decimal   `json:"total_amount"`
+	Currency        string            `json:"currency"`
+	FulfillmentType FulfillmentType   `json:"fulfillment_type"`
+	LocationID      pgtype.Text       `json:"location_id"`
+	DeliveryAddress pgtype.Text       `json:"delivery_address"`
+	Items           []byte            `json:"items"`
+	OrderID         pgtype.Text       `json:"order_id"`
+	SourceMessageID pgtype.Text       `json:"source_message_id"`
+	ExpiresAt       pgtype.Timestamp  `json:"expires_at"`
+	CreatedAt       pgtype.Timestamp  `json:"created_at"`
+	UpdatedAt       pgtype.Timestamp  `json:"updated_at"`
 }
 
 type OrderItem struct {

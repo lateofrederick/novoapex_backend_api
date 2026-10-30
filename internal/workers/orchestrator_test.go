@@ -1062,3 +1062,107 @@ func TestOpipeReorderResetFromPaidOrCancelled(t *testing.T) {
 		})
 	}
 }
+
+// Regression for Issue 1: A customer who just paid sends a follow-up acknowledgment
+// ("Great!!", "Okay"). Even if the LLM hallucinated OrderConfirmed=true and carried over
+// detected items, the orchestrator MUST NOT enqueue a checkout job or create an order.
+func TestOpipePostPaymentAcknowledgmentDoesNotTriggerOrder(t *testing.T) {
+	e := opipeStart(t)
+	biz := e.factory.Business()
+	prod := e.factory.Product(biz.ID, harness.WithPrice("2.50"))
+	sender := biz.OwnerPhone
+
+	// 1. Establish conversation in PAID state
+	e.llm.steps = []orchestrator.LlmResponse{opipeResp(nil)}
+	opipeInbound(t, e.db, biz.WhatsAppPhoneNumberID, sender, "wamid-init", "hello")
+	opipeRun(t, e, biz, sender)
+
+	if _, err := e.db.Exec(`UPDATE conversations SET state = 'PAID'
+		WHERE business_id = $1 AND customer_phone = $2`, biz.ID, sender); err != nil {
+		t.Fatal(err)
+	}
+
+	// 2. Customer sends post-payment acknowledgment "Great!!"
+	// LLM hallucinates OrderConfirmed=true with the previous product
+	e.llm.steps = []orchestrator.LlmResponse{opipeResp(func(r *orchestrator.LlmResponse) {
+		r.Intent = "checkout_request"
+		r.ReplyText = "I'm glad to hear that! Your order will be on its way soon! 😊"
+		r.CrmSignals.OrderConfirmed = true
+		r.CrmSignals.DetectedItems = []orchestrator.DetectedItem{
+			{ProductID: prod.ID[:8], Quantity: 1},
+		}
+	})}
+	opipeInbound(t, e.db, biz.WhatsAppPhoneNumberID, sender, "wamid-ack", "Great!!")
+	opipeRun(t, e, biz, sender)
+
+	// 3. Verify: NO TaskCheckout job enqueued!
+	checkouts := e.publisher.ofTask(queue.TaskCheckout)
+	if len(checkouts) != 0 {
+		t.Fatalf("checkout jobs enqueued = %d, want 0 (must not trigger order from PAID acknowledgment)", len(checkouts))
+	}
+
+	// 4. Verify: State safely reset to BROWSING
+	state, _, _ := opipeConvRow(t, e.db, biz.ID, sender)
+	if state != "BROWSING" {
+		t.Errorf("conversation state = %s, want BROWSING", state)
+	}
+}
+
+// TestOpipeOrderIntentLifecycleStagesAndConverts verifies that a 2-turn purchase
+// stages an order_intent on turn 1 and converts it on turn 2.
+func TestOpipeOrderIntentLifecycleStagesAndConverts(t *testing.T) {
+	e := opipeStart(t)
+	biz := e.factory.Business()
+	prod := e.factory.Product(biz.ID, harness.WithStock(10), harness.WithPrice("25.50"))
+	sender := biz.OwnerPhone
+	shortID := prod.ID[:8]
+
+	// Turn 1: Customer asks to buy items -> Bot stages order intent in AWAITING_CONFIRMATION
+	e.llm.steps = []orchestrator.LlmResponse{
+		opipeResp(func(r *orchestrator.LlmResponse) {
+			r.Intent = "checkout_request"
+			r.ReplyText = "You'd like to order 1x product for GH₵25.50. Should I confirm this order?"
+			r.CrmSignals.OrderConfirmed = false
+			r.CrmSignals.DetectedItems = []orchestrator.DetectedItem{
+				{ProductID: shortID, Quantity: 1},
+			}
+		}),
+		opipeResp(func(r *orchestrator.LlmResponse) {
+			r.Intent = "checkout_request"
+			r.ReplyText = "Your order is confirmed!"
+			r.CrmSignals.OrderConfirmed = true
+			r.CrmSignals.DetectedItems = []orchestrator.DetectedItem{
+				{ProductID: shortID, Quantity: 1},
+			}
+		}),
+	}
+
+	opipeInbound(t, e.db, biz.WhatsAppPhoneNumberID, sender, "wamid-stage-1", "I want to buy 1 piece")
+	opipeRun(t, e, biz, sender)
+
+	// Verify order_intent was staged
+	var intentStatus string
+	var intentCount int
+	if err := e.db.QueryRow(`SELECT count(*), COALESCE(max(status::text),'') FROM order_intents
+		WHERE business_id = $1`, biz.ID).Scan(&intentCount, &intentStatus); err != nil {
+		t.Fatal(err)
+	}
+	if intentCount != 1 || intentStatus != "AWAITING_CONFIRMATION" {
+		t.Fatalf("staged intent: count=%d status=%s, want 1 AWAITING_CONFIRMATION", intentCount, intentStatus)
+	}
+
+	// Turn 2: Customer confirms -> Intent converts to CONVERTED
+	opipeInbound(t, e.db, biz.WhatsAppPhoneNumberID, sender, "wamid-stage-2", "Yes, confirm")
+	opipeRun(t, e, biz, sender)
+	opipeDrainCheckout(t, e)
+
+	var convertedStatus string
+	var orderID string
+	if err := e.db.QueryRow(`SELECT status::text, COALESCE(order_id,'') FROM order_intents
+		WHERE business_id = $1`, biz.ID).Scan(&convertedStatus, &orderID); err != nil {
+		t.Fatal(err)
+	}
+	if convertedStatus != "CONVERTED" || orderID == "" {
+		t.Fatalf("converted intent: status=%s order_id=%s, want CONVERTED and non-empty order_id", convertedStatus, orderID)
+	}
+}
