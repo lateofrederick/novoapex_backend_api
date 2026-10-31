@@ -48,8 +48,9 @@ const (
 	// (webhook.processor.ts:158, orchestrator.processor.ts:85).
 	OrchestratorDebounceDelay = 3 * time.Second
 
-	orch24hWindow       = 24 * time.Hour
-	orchMaxAudioBytes   = 10 * 1024 * 1024 // :408
+	orch24hWindow            = 24 * time.Hour
+	orchSessionInactivityGap = 2 * time.Hour
+	orchMaxAudioBytes        = 10 * 1024 * 1024 // :408
 	orchConfidenceFloor = 0.7              // :539
 	orchHistoryPerSide  = 10               // :481/:487
 
@@ -511,6 +512,7 @@ func orchEnforceSafetyGuardrails(ctx context.Context, deps OrchestratorDeps, oc 
 // orchFetchConversationHistory ports fetchConversationHistory (:477-509):
 // last 10 inbound (by timestamp desc) + last 10 outbound (by createdAt desc)
 // within the active 24h window, merged sorted ascending, sliced to the last 10,
+// pruned across inactivity session gaps (> 2h) and post-payment boundaries,
 // THEN empty-filtered (an empty message inside the newest ten still burns its
 // budget slot), mapped to single-text-part chat messages.
 func orchFetchConversationHistory(ctx context.Context, pool *pgxpool.Pool, conversationID string) ([]orchestrator.ChatMessage, error) {
@@ -521,6 +523,19 @@ func orchFetchConversationHistory(ctx context.Context, pool *pgxpool.Pool, conve
 	}
 
 	since := time.Now().UTC().Add(-orch24hWindow)
+
+	// Paid order boundary: messages prior to the completion of the latest PAID order
+	// belong to the completed transaction and must not leak into active history.
+	var latestPaidAt pgtype.Timestamp
+	err := pool.QueryRow(ctx,
+		`SELECT MAX(updated_at) FROM orders WHERE conversation_id = $1 AND status = 'PAID'`,
+		conversationID).Scan(&latestPaidAt)
+	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+		return nil, fmt.Errorf("orchestrator: latest paid order lookup: %w", err)
+	}
+	if latestPaidAt.Valid && latestPaidAt.Time.After(since) {
+		since = latestPaidAt.Time
+	}
 
 	inRows, err := pool.Query(ctx,
 		`SELECT COALESCE(text_content,''), "timestamp" FROM inbound_messages
@@ -572,6 +587,20 @@ func orchFetchConversationHistory(ctx context.Context, pool *pgxpool.Pool, conve
 		history = history[len(history)-orchHistoryPerSide:] // :505-506 slice(-10)
 	}
 
+	// Inactivity gap: if there is an inactivity gap > orchSessionInactivityGap
+	// between consecutive messages, prune all messages prior to the latest gap.
+	if len(history) > 1 {
+		lastGapIdx := -1
+		for i := 1; i < len(history); i++ {
+			if time.Duration(history[i].at-history[i-1].at)*time.Millisecond > orchSessionInactivityGap {
+				lastGapIdx = i
+			}
+		}
+		if lastGapIdx > 0 {
+			history = history[lastGapIdx:]
+		}
+	}
+
 	messages := make([]orchestrator.ChatMessage, 0, len(history))
 	for _, h := range history {
 		if strings.TrimSpace(h.content) == "" { // :507 filter AFTER slice
@@ -585,13 +614,64 @@ func orchFetchConversationHistory(ctx context.Context, pool *pgxpool.Pool, conve
 	return messages, nil
 }
 
+// FetchConversationHistory is the exported wrapper around orchFetchConversationHistory for testing.
+func FetchConversationHistory(ctx context.Context, pool *pgxpool.Pool, conversationID string) ([]orchestrator.ChatMessage, error) {
+	return orchFetchConversationHistory(ctx, pool, conversationID)
+}
+
+var shortCourtesyWords = map[string]bool{
+	"ok": true, "okay": true, "yes": true, "yeah": true, "yep": true,
+	"sure": true, "no": true, "nope": true, "thanks": true, "thank you": true,
+	"great": true, "perfect": true, "noted": true, "received": true,
+}
+
+// ResolveCatalogSearchText enriches short follow-up inquiries (e.g. "Confirm price.",
+// "How much?", "Is it available?") with context from preceding conversation turns so
+// semantic catalog retrieval finds the referenced product rather than failing on
+// the short phrase.
+func ResolveCatalogSearchText(textContent string, history []orchestrator.ChatMessage) string {
+	trimmed := strings.TrimSpace(textContent)
+	words := strings.Fields(trimmed)
+	// If the customer message already has substantial detail (> 5 words), do not mutate.
+	if len(words) > 5 || len(history) == 0 {
+		return textContent
+	}
+
+	endIdx := len(history) - 1
+	// If the latest message in history matches the current turn, step back to previous turns.
+	if endIdx >= 0 && len(history[endIdx].Parts) > 0 && strings.TrimSpace(history[endIdx].Parts[0].Text) == trimmed {
+		endIdx--
+	}
+
+	for i := endIdx; i >= 0; i-- {
+		for _, part := range history[i].Parts {
+			if part.Type != "text" {
+				continue
+			}
+			text := strings.TrimSpace(part.Text)
+			if text == "" {
+				continue
+			}
+			// Skip filler courtesy acknowledgments that don't add product context.
+			normalized := strings.ToLower(strings.Trim(text, "!.?, \t\r\n"))
+			if shortCourtesyWords[normalized] {
+				continue
+			}
+			return text + " " + trimmed
+		}
+	}
+
+	return textContent
+}
+
 // orchGenerateAndHandleLlmResponse ports generateAndHandleLlmResponse
 // (:511-644): catalog context, already-shown context, LLM call, then the
 // response-handling phases in source order.
 func orchGenerateAndHandleLlmResponse(ctx context.Context, deps OrchestratorDeps, oc orchContext, latest *orchLatest, textContent, imageURL string, history []orchestrator.ChatMessage) error {
 	catalogContext := ""
 	if deps.Catalog != nil {
-		cc, err := deps.Catalog(ctx, oc.businessID, textContent, oc.currency, imageURL)
+		catalogSearchText := ResolveCatalogSearchText(textContent, history)
+		cc, err := deps.Catalog(ctx, oc.businessID, catalogSearchText, oc.currency, imageURL)
 		if err != nil {
 			slog.Error("Failed to retrieve context", "err", err)
 			catalogContext = "Catalog retrieval failed.\n" // retriever catch-branch

@@ -1166,3 +1166,215 @@ func TestOpipeOrderIntentLifecycleStagesAndConverts(t *testing.T) {
 		t.Fatalf("converted intent: status=%s order_id=%s, want CONVERTED and non-empty order_id", convertedStatus, orderID)
 	}
 }
+
+func TestResolveCatalogSearchText(t *testing.T) {
+	// Case 1: Short follow-up carries forward product details from assistant response
+	history1 := []orchestrator.ChatMessage{
+		{Role: "user", Parts: []orchestrator.MessagePart{{Type: "text", Text: "I need to buy a hair bundle. 1pc."}}},
+		{Role: "assistant", Parts: []orchestrator.MessagePart{{Type: "text", Text: "The Human Hair Bundle is GH₵4 [ID: prod123]. Would you like to see a photo?"}}},
+		{Role: "user", Parts: []orchestrator.MessagePart{{Type: "text", Text: "Confirm price."}}},
+	}
+	got1 := workers.ResolveCatalogSearchText("Confirm price.", history1)
+	want1 := "The Human Hair Bundle is GH₵4 [ID: prod123]. Would you like to see a photo? Confirm price."
+	if got1 != want1 {
+		t.Errorf("got %q, want %q", got1, want1)
+	}
+
+	// Case 2: Short courtesy responses ("okay", "yes") are skipped to reach substantive context
+	history2 := []orchestrator.ChatMessage{
+		{Role: "user", Parts: []orchestrator.MessagePart{{Type: "text", Text: "What is the price of Shea Butter?"}}},
+		{Role: "assistant", Parts: []orchestrator.MessagePart{{Type: "text", Text: "Shea Butter is GH₵35 [ID: shea456]"}}},
+		{Role: "user", Parts: []orchestrator.MessagePart{{Type: "text", Text: "okay"}}},
+		{Role: "user", Parts: []orchestrator.MessagePart{{Type: "text", Text: "How much?"}}},
+	}
+	got2 := workers.ResolveCatalogSearchText("How much?", history2)
+	want2 := "Shea Butter is GH₵35 [ID: shea456] How much?"
+	if got2 != want2 {
+		t.Errorf("got %q, want %q", got2, want2)
+	}
+
+	// Case 3: Long query (> 5 words) is left untouched
+	longQuery := "I want to order three bottles of moisturising body lotion"
+	got3 := workers.ResolveCatalogSearchText(longQuery, history1)
+	if got3 != longQuery {
+		t.Errorf("got %q, want %q", got3, longQuery)
+	}
+
+	// Case 4: Empty history returns textContent untouched
+	got4 := workers.ResolveCatalogSearchText("Confirm price.", nil)
+	if got4 != "Confirm price." {
+		t.Errorf("got %q, want %q", got4, "Confirm price.")
+	}
+}
+
+func TestOpipeHistoryInactivityGapPruning(t *testing.T) {
+	e := opipeStart(t)
+	biz := e.factory.Business()
+	sender := biz.OwnerPhone
+
+	oc, ok, err := workers.ResolveConversationContext(context.Background(), e.pool, biz.WhatsAppPhoneNumberID, sender)
+	if err != nil || !ok {
+		t.Fatalf("resolve context: ok=%v err=%v", ok, err)
+	}
+
+	insertInbound := func(text string, at time.Time) {
+		raw, _ := json.Marshal(map[string]any{"type": "text"})
+		if _, err := e.db.Exec(`INSERT INTO inbound_messages
+			(id, whatsapp_message_id, sender_phone, recipient_phone, message_type, text_content, raw_payload, "timestamp", business_id, conversation_id, created_at)
+			VALUES ($1,$1,$2,$3,'text',NULLIF($4,''),$5,$6,$7,$8,$6)`,
+			fmt.Sprintf("in-%d", at.UnixNano()), sender, biz.WhatsAppPhoneNumberID, text, raw, at, biz.ID, oc.ConversationID); err != nil {
+			t.Fatal(err)
+		}
+	}
+	insertOutbound := func(text string, at time.Time) {
+		raw, _ := json.Marshal(map[string]any{})
+		if _, err := e.db.Exec(`INSERT INTO outbound_messages
+			(id, recipient_phone, message_type, text_content, raw_payload, status, business_id, conversation_id, created_at)
+			VALUES ($1,$2,'text',$3,$4,'sent',$5,$6,$7)`,
+			fmt.Sprintf("out-%d", at.UnixNano()), sender, text, raw, biz.ID, oc.ConversationID, at); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	now := time.Now()
+	// Stale session from 5 hours ago
+	insertInbound("old session question", now.Add(-5*time.Hour))
+	insertOutbound("old session answer", now.Add(-5*time.Hour+time.Minute))
+
+	// Inactivity gap: ~4 hours between old session answer and new session question
+
+	// New active session starting 40 minutes ago
+	insertInbound("new session question", now.Add(-40*time.Minute))
+	insertOutbound("new session answer", now.Add(-39*time.Minute))
+	insertInbound("latest follow-up", now.Add(-10*time.Minute))
+
+	history, err := workers.FetchConversationHistory(context.Background(), e.pool, oc.ConversationID)
+	if err != nil {
+		t.Fatalf("FetchConversationHistory: %v", err)
+	}
+
+	if len(history) != 3 {
+		t.Fatalf("expected 3 messages after inactivity gap pruning, got %d: %+v", len(history), history)
+	}
+	if history[0].Parts[0].Text != "new session question" {
+		t.Errorf("history[0] = %q, want 'new session question'", history[0].Parts[0].Text)
+	}
+	if history[1].Parts[0].Text != "new session answer" {
+		t.Errorf("history[1] = %q, want 'new session answer'", history[1].Parts[0].Text)
+	}
+	if history[2].Parts[0].Text != "latest follow-up" {
+		t.Errorf("history[2] = %q, want 'latest follow-up'", history[2].Parts[0].Text)
+	}
+}
+
+func TestOpipeHistoryPaidOrderBoundary(t *testing.T) {
+	e := opipeStart(t)
+	biz := e.factory.Business()
+	sender := biz.OwnerPhone
+
+	oc, ok, err := workers.ResolveConversationContext(context.Background(), e.pool, biz.WhatsAppPhoneNumberID, sender)
+	if err != nil || !ok {
+		t.Fatalf("resolve context: ok=%v err=%v", ok, err)
+	}
+
+	insertInbound := func(text string, at time.Time) {
+		raw, _ := json.Marshal(map[string]any{"type": "text"})
+		if _, err := e.db.Exec(`INSERT INTO inbound_messages
+			(id, whatsapp_message_id, sender_phone, recipient_phone, message_type, text_content, raw_payload, "timestamp", business_id, conversation_id, created_at)
+			VALUES ($1,$1,$2,$3,'text',NULLIF($4,''),$5,$6,$7,$8,$6)`,
+			fmt.Sprintf("in-%d", at.UnixNano()), sender, biz.WhatsAppPhoneNumberID, text, raw, at, biz.ID, oc.ConversationID); err != nil {
+			t.Fatal(err)
+		}
+	}
+	insertOutbound := func(text string, at time.Time) {
+		raw, _ := json.Marshal(map[string]any{})
+		if _, err := e.db.Exec(`INSERT INTO outbound_messages
+			(id, recipient_phone, message_type, text_content, raw_payload, status, business_id, conversation_id, created_at)
+			VALUES ($1,$2,'text',$3,$4,'sent',$5,$6,$7)`,
+			fmt.Sprintf("out-%d", at.UnixNano()), sender, text, raw, biz.ID, oc.ConversationID, at); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	now := time.Now()
+	// Pre-order discussion 1 hour ago
+	insertInbound("How much is the hair bundle?", now.Add(-60*time.Minute))
+	insertOutbound("The hair bundle is GH₵4.00", now.Add(-58*time.Minute))
+	insertInbound("I want to confirm order", now.Add(-55*time.Minute))
+
+	// An order was paid 45 minutes ago
+	orderPaidAt := now.Add(-45 * time.Minute)
+	if _, err := e.db.Exec(`INSERT INTO orders
+		(id, business_id, customer_id, conversation_id, status, total_amount, currency, created_at, updated_at)
+		VALUES ($1, $2, $3, $4, 'PAID', 4.00, 'GHS', $5, $5)`,
+		fmt.Sprintf("ord-%d", now.UnixNano()), biz.ID, oc.CustomerID, oc.ConversationID, orderPaidAt); err != nil {
+		t.Fatal(err)
+	}
+
+	// Post-payment messages (must be included)
+	insertInbound("Thank you!", now.Add(-40*time.Minute))
+	insertInbound("What else do you have?", now.Add(-10*time.Minute))
+
+	history, err := workers.FetchConversationHistory(context.Background(), e.pool, oc.ConversationID)
+	if err != nil {
+		t.Fatalf("FetchConversationHistory: %v", err)
+	}
+
+	// Pre-order messages (older than orderPaidAt) must be pruned
+	if len(history) != 2 {
+		t.Fatalf("expected 2 post-payment messages, got %d: %+v", len(history), history)
+	}
+	if history[0].Parts[0].Text != "Thank you!" {
+		t.Errorf("history[0] = %q, want 'Thank you!'", history[0].Parts[0].Text)
+	}
+	if history[1].Parts[0].Text != "What else do you have?" {
+		t.Errorf("history[1] = %q, want 'What else do you have?'", history[1].Parts[0].Text)
+	}
+}
+
+func TestOpipeCatalogContextCarryForwardOnShortQuery(t *testing.T) {
+	e := opipeStart(t)
+	biz := e.factory.Business()
+	sender := biz.OwnerPhone
+
+	oc, ok, err := workers.ResolveConversationContext(context.Background(), e.pool, biz.WhatsAppPhoneNumberID, sender)
+	if err != nil || !ok {
+		t.Fatalf("resolve context: ok=%v err=%v", ok, err)
+	}
+
+	// Seed previous turn in history where Human Hair Bundle was quoted
+	now := time.Now()
+	raw, _ := json.Marshal(map[string]any{})
+	if _, err := e.db.Exec(`INSERT INTO outbound_messages
+		(id, recipient_phone, message_type, text_content, raw_payload, status, business_id, conversation_id, created_at)
+		VALUES ($1,$2,'text',$3,$4,'sent',$5,$6,$7)`,
+		fmt.Sprintf("out-%d", now.UnixNano()), sender, "The Human Hair Bundle is GH₵4 [ID: prod123]", raw, biz.ID, oc.ConversationID, now.Add(-2*time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+
+	var capturedCatalogSearchText string
+	origCatalog := e.deps.Catalog
+	e.deps.Catalog = func(ctx context.Context, businessID, searchText, currency, imageURL string) (string, error) {
+		capturedCatalogSearchText = searchText
+		if origCatalog != nil {
+			return origCatalog(ctx, businessID, searchText, currency, imageURL)
+		}
+		return "=== CATALOG ===\n[ID: prod123] Human Hair Bundle - GH₵2.50\n", nil
+	}
+
+	e.llm.steps = []orchestrator.LlmResponse{
+		opipeResp(func(r *orchestrator.LlmResponse) {
+			r.Intent = "product_inquiry"
+			r.ReplyText = "The Human Hair Bundle is GH₵2.50 [ID: prod123]"
+		}),
+	}
+
+	// Customer sends short follow-up "Confirm price."
+	opipeInbound(t, e.db, biz.WhatsAppPhoneNumberID, sender, "wamid-confirm-price", "Confirm price.")
+	opipeRun(t, e, biz, sender)
+
+	// Verify deps.Catalog received the carried-forward product text
+	if !strings.Contains(capturedCatalogSearchText, "Human Hair Bundle") || !strings.Contains(capturedCatalogSearchText, "Confirm price.") {
+		t.Errorf("deps.Catalog search query = %q, expected it to contain 'Human Hair Bundle' and 'Confirm price.'", capturedCatalogSearchText)
+	}
+}
