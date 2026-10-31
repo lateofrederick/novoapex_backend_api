@@ -528,7 +528,9 @@ func orchFetchConversationHistory(ctx context.Context, pool *pgxpool.Pool, conve
 	// belong to the completed transaction and must not leak into active history.
 	var latestPaidAt pgtype.Timestamp
 	err := pool.QueryRow(ctx,
-		`SELECT MAX(updated_at) FROM orders WHERE conversation_id = $1 AND status = 'PAID'`,
+		`SELECT MAX(updated_at) FROM orders
+		 WHERE (conversation_id = $1 OR customer_id = (SELECT customer_id FROM conversations WHERE id = $1))
+		   AND status IN ('PAID', 'PROCESSING', 'SHIPPED', 'DELIVERED')`,
 		conversationID).Scan(&latestPaidAt)
 	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
 		return nil, fmt.Errorf("orchestrator: latest paid order lookup: %w", err)
@@ -539,7 +541,7 @@ func orchFetchConversationHistory(ctx context.Context, pool *pgxpool.Pool, conve
 
 	inRows, err := pool.Query(ctx,
 		`SELECT COALESCE(text_content,''), "timestamp" FROM inbound_messages
-		 WHERE conversation_id = $1 AND "timestamp" >= $2
+		 WHERE conversation_id = $1 AND "timestamp" > $2
 		 ORDER BY "timestamp" DESC LIMIT $3`,
 		conversationID, since, orchHistoryPerSide)
 	if err != nil {
@@ -562,7 +564,10 @@ func orchFetchConversationHistory(ctx context.Context, pool *pgxpool.Pool, conve
 
 	outRows, err := pool.Query(ctx,
 		`SELECT COALESCE(text_content,''), created_at FROM outbound_messages
-		 WHERE conversation_id = $1 AND created_at >= $2
+		 WHERE conversation_id = $1 AND created_at > $2
+		   AND text_content NOT LIKE '✅ Payment of % received%'
+		   AND text_content NOT LIKE '%Tap the link below to pay securely%'
+		   AND template_name IS NULL
 		 ORDER BY created_at DESC LIMIT $3`,
 		conversationID, since, orchHistoryPerSide)
 	if err != nil {
@@ -575,6 +580,7 @@ func orchFetchConversationHistory(ctx context.Context, pool *pgxpool.Pool, conve
 			outRows.Close()
 			return nil, fmt.Errorf("orchestrator: scan outbound history: %w", err)
 		}
+		content = stripInternalProductIDs(content)
 		history = append(history, item{role: "assistant", content: content, at: ts.UnixMilli()})
 	}
 	outRows.Close()
@@ -617,6 +623,16 @@ func orchFetchConversationHistory(ctx context.Context, pool *pgxpool.Pool, conve
 // FetchConversationHistory is the exported wrapper around orchFetchConversationHistory for testing.
 func FetchConversationHistory(ctx context.Context, pool *pgxpool.Pool, conversationID string) ([]orchestrator.ChatMessage, error) {
 	return orchFetchConversationHistory(ctx, pool, conversationID)
+}
+
+// StripInternalProductIDs is the exported wrapper around stripInternalProductIDs for testing.
+func StripInternalProductIDs(s string) string {
+	return stripInternalProductIDs(s)
+}
+
+// SyncCatalogPricesInHistory is the exported wrapper around syncCatalogPricesInHistory for testing.
+func SyncCatalogPricesInHistory(history []orchestrator.ChatMessage, catalogContext string) []orchestrator.ChatMessage {
+	return syncCatalogPricesInHistory(history, catalogContext)
 }
 
 var shortCourtesyWords = map[string]bool{
@@ -664,6 +680,124 @@ func ResolveCatalogSearchText(textContent string, history []orchestrator.ChatMes
 	return textContent
 }
 
+var (
+	reInternalProductID = regexp.MustCompile(`(?i)\s*\[ID:\s*[^\]]+\]`)
+	reCatalogLine       = regexp.MustCompile(`(?m)^\[ID:\s*([^\]]+)\]\s*(.*?)\s*[—-]\s*((?:GH₵|GHS|¢|\$|₦)\s*[\d,]+(?:\.\d{2})?)`)
+	rePricePattern      = regexp.MustCompile(`(?:GH₵|GHS|¢|\$|₦)\s*[\d,]+(?:\.\d{2})?`)
+)
+
+// stripInternalProductIDs removes internal product tags such as [ID: abc123] from
+// text, cleaning up any resulting redundant whitespace.
+func stripInternalProductIDs(s string) string {
+	s = reInternalProductID.ReplaceAllString(s, "")
+	for strings.Contains(s, "  ") {
+		s = strings.ReplaceAll(s, "  ", " ")
+	}
+	return strings.TrimSpace(s)
+}
+
+type catalogItem struct {
+	id    string
+	name  string
+	price string
+}
+
+func parseCatalogItems(catalogContext string) []catalogItem {
+	matches := reCatalogLine.FindAllStringSubmatch(catalogContext, -1)
+	if len(matches) == 0 {
+		return nil
+	}
+	items := make([]catalogItem, 0, len(matches))
+	for _, m := range matches {
+		items = append(items, catalogItem{
+			id:    strings.TrimSpace(m[1]),
+			name:  strings.TrimSpace(m[2]),
+			price: strings.TrimSpace(m[3]),
+		})
+	}
+	return items
+}
+
+// updateProductPriceInText updates any price quoted near productName in text to livePrice.
+func updateProductPriceInText(text, productName, livePrice string) string {
+	if livePrice == "" {
+		return text
+	}
+	quotedName := regexp.QuoteMeta(productName)
+
+	// Pattern 1: Product name followed by old price, e.g. "Human Hair Bundle is GH₵4"
+	reAfter := regexp.MustCompile(`(?i)(` + quotedName + `[^\n.?!]*?)(?:GH₵|GHS|¢|\$|₦)\s*[\d,]+(?:\.\d{2})?`)
+	if reAfter.MatchString(text) {
+		return reAfter.ReplaceAllString(text, "${1}"+livePrice)
+	}
+
+	// Pattern 2: Old price followed by product name, e.g. "GH₵4 for Human Hair Bundle"
+	reBefore := regexp.MustCompile(`(?i)(?:GH₵|GHS|¢|\$|₦)\s*[\d,]+(?:\.\d{2})?([^\n.?!]*?` + quotedName + `)`)
+	if reBefore.MatchString(text) {
+		return reBefore.ReplaceAllString(text, livePrice+"${1}")
+	}
+
+	// Pattern 3: If message mentions the product and has only a single price, update that price
+	prices := rePricePattern.FindAllString(text, -1)
+	if len(prices) == 1 {
+		return strings.Replace(text, prices[0], livePrice, 1)
+	}
+
+	return text
+}
+
+// syncCatalogPricesInHistory reconciles prices in assistant messages with the live catalog
+// and strips internal technical IDs ([ID: xxx]) so the LLM is never autoregressively
+// anchored to stale quotes or technical IDs.
+func syncCatalogPricesInHistory(history []orchestrator.ChatMessage, catalogContext string) []orchestrator.ChatMessage {
+	if len(history) == 0 {
+		return history
+	}
+	items := parseCatalogItems(catalogContext)
+
+	result := make([]orchestrator.ChatMessage, len(history))
+	for i, msg := range history {
+		if msg.Role != "assistant" {
+			result[i] = msg
+			continue
+		}
+
+		newParts := make([]orchestrator.MessagePart, len(msg.Parts))
+		for j, part := range msg.Parts {
+			if part.Type != "text" {
+				newParts[j] = part
+				continue
+			}
+			text := part.Text
+
+			// Synchronize prices for each catalog item referenced in this assistant turn
+			for _, item := range items {
+				nameLower := strings.ToLower(item.name)
+				idLower := strings.ToLower(item.id)
+				textLower := strings.ToLower(text)
+
+				if strings.Contains(textLower, nameLower) || (item.id != "" && strings.Contains(textLower, idLower)) {
+					text = updateProductPriceInText(text, item.name, item.price)
+				}
+			}
+
+			// Strip technical product IDs
+			text = stripInternalProductIDs(text)
+
+			newParts[j] = orchestrator.MessagePart{
+				Type:     part.Type,
+				Text:     text,
+				ImageURL: part.ImageURL,
+			}
+		}
+		result[i] = orchestrator.ChatMessage{
+			Role:  msg.Role,
+			Parts: newParts,
+		}
+	}
+	return result
+}
+
 // orchGenerateAndHandleLlmResponse ports generateAndHandleLlmResponse
 // (:511-644): catalog context, already-shown context, LLM call, then the
 // response-handling phases in source order.
@@ -696,6 +830,10 @@ func orchGenerateAndHandleLlmResponse(ctx context.Context, deps OrchestratorDeps
 		}
 	}
 	customerContextCtx := orchBuildCustomerContext(oc, favoriteProduct)
+
+	// Synchronize any outdated price quotes in assistant history with live catalog prices
+	// and strip internal product IDs so the LLM is never anchored to stale pricing or technical IDs.
+	history = syncCatalogPricesInHistory(history, catalogContext)
 
 	paymentMethods := orchCurrencyFor(oc.currency).PaymentMethods
 	req := orchestrator.GenerateRequest{
@@ -758,6 +896,7 @@ func orchGenerateAndHandleLlmResponse(ctx context.Context, deps OrchestratorDeps
 		}
 	}
 
+	resp.ReplyText = stripInternalProductIDs(resp.ReplyText)
 	if err := orchEnqueueOutboundText(ctx, deps, oc.businessID, oc.conversationID, resp.ReplyText); err != nil {
 		return err
 	}

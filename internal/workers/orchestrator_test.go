@@ -1378,3 +1378,173 @@ func TestOpipeCatalogContextCarryForwardOnShortQuery(t *testing.T) {
 		t.Errorf("deps.Catalog search query = %q, expected it to contain 'Human Hair Bundle' and 'Confirm price.'", capturedCatalogSearchText)
 	}
 }
+
+func TestStripInternalProductIDs(t *testing.T) {
+	cases := []struct {
+		name string
+		in   string
+		want string
+	}{
+		{
+			name: "single product recommendation with id",
+			in:   "We have Shea Butter [ID: abc12345] available for GH₵45.",
+			want: "We have Shea Butter available for GH₵45.",
+		},
+		{
+			name: "product list with multiple ids",
+			in:   "1. Shea Butter - GH₵45 [ID: abc12345]\n2. Black Soap - GH₵20 [ID: def67890]",
+			want: "1. Shea Butter - GH₵45\n2. Black Soap - GH₵20",
+		},
+		{
+			name: "id at start of text",
+			in:   "[ID: abc12345] Shea Butter is back in stock!",
+			want: "Shea Butter is back in stock!",
+		},
+		{
+			name: "case insensitive id tag",
+			in:   "Order confirmed for [id: xyz999].",
+			want: "Order confirmed for.",
+		},
+		{
+			name: "text with no ids remains unchanged",
+			in:   "Welcome to our shop! How can I help you today?",
+			want: "Welcome to our shop! How can I help you today?",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := workers.StripInternalProductIDs(tc.in)
+			if got != tc.want {
+				t.Errorf("StripInternalProductIDs(%q) = %q, want %q", tc.in, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestSyncCatalogPricesInHistory(t *testing.T) {
+	catalog := "=== CATALOG ===\n[ID: prod123] Human Hair Bundle — GH₵12.00 (5 available)\n[ID: shea456] Shea Butter — GH₵45.00\n"
+
+	history := []orchestrator.ChatMessage{
+		{
+			Role: "user",
+			Parts: []orchestrator.MessagePart{
+				{Type: "text", Text: "I want to buy the hair bundle. Earlier you said it was GH₵4."},
+			},
+		},
+		{
+			Role: "assistant",
+			Parts: []orchestrator.MessagePart{
+				{Type: "text", Text: "The Human Hair Bundle is GH₵4 [ID: prod123]. Would you like to see a photo?"},
+			},
+		},
+		{
+			Role: "assistant",
+			Parts: []orchestrator.MessagePart{
+				{Type: "text", Text: "We also have Shea Butter is GH₵35 [ID: shea456]."},
+			},
+		},
+	}
+
+	synced := workers.SyncCatalogPricesInHistory(history, catalog)
+
+	// User message text must be preserved untouched
+	if synced[0].Parts[0].Text != "I want to buy the hair bundle. Earlier you said it was GH₵4." {
+		t.Errorf("user message was altered: %q", synced[0].Parts[0].Text)
+	}
+
+	// Assistant message 1: Human Hair Bundle price synced to GH₵12.00, [ID: prod123] stripped
+	want1 := "The Human Hair Bundle is GH₵12.00. Would you like to see a photo?"
+	if synced[1].Parts[0].Text != want1 {
+		t.Errorf("assistant message 1 = %q, want %q", synced[1].Parts[0].Text, want1)
+	}
+
+	// Assistant message 2: Shea Butter price synced to GH₵45.00, [ID: shea456] stripped
+	want2 := "We also have Shea Butter is GH₵45.00."
+	if synced[2].Parts[0].Text != want2 {
+		t.Errorf("assistant message 2 = %q, want %q", synced[2].Parts[0].Text, want2)
+	}
+}
+
+func TestOpipeOutboundStripsProductIDs(t *testing.T) {
+	e := opipeStart(t)
+	biz := e.factory.Business()
+	sender := biz.OwnerPhone
+
+	oc, ok, err := workers.ResolveConversationContext(context.Background(), e.pool, biz.WhatsAppPhoneNumberID, sender)
+	if err != nil || !ok {
+		t.Fatalf("resolve context: ok=%v err=%v", ok, err)
+	}
+
+	e.llm.steps = []orchestrator.LlmResponse{
+		opipeResp(func(r *orchestrator.LlmResponse) {
+			r.Intent = "product_inquiry"
+			r.ReplyText = "We have the Human Hair Bundle for GH₵12.00 [ID: prod123]. Would you like to order?"
+		}),
+	}
+
+	opipeInbound(t, e.db, biz.WhatsAppPhoneNumberID, sender, "wamid-strip-test-1", "Do you have human hair?")
+	opipeRun(t, e, biz, sender)
+
+	var sentText string
+	if err := e.db.QueryRow(`SELECT text_content FROM outbound_messages WHERE conversation_id = $1 ORDER BY created_at DESC LIMIT 1`,
+		oc.ConversationID).Scan(&sentText); err != nil {
+		t.Fatal(err)
+	}
+
+	wantSent := "We have the Human Hair Bundle for GH₵12.00. Would you like to order?"
+	if sentText != wantSent {
+		t.Errorf("outbound text = %q, want %q (internal product ID must be stripped)", sentText, wantSent)
+	}
+}
+
+func TestOpipeHistoryFiltersAutomatedMessages(t *testing.T) {
+	e := opipeStart(t)
+	biz := e.factory.Business()
+	sender := biz.OwnerPhone
+
+	oc, ok, err := workers.ResolveConversationContext(context.Background(), e.pool, biz.WhatsAppPhoneNumberID, sender)
+	if err != nil || !ok {
+		t.Fatalf("resolve context: ok=%v err=%v", ok, err)
+	}
+
+	now := time.Now()
+	raw, _ := json.Marshal(map[string]any{})
+
+	// Insert conversational outbound
+	if _, err := e.db.Exec(`INSERT INTO outbound_messages
+		(id, recipient_phone, message_type, text_content, raw_payload, status, business_id, conversation_id, created_at)
+		VALUES ($1,$2,'text',$3,$4,'sent',$5,$6,$7)`,
+		fmt.Sprintf("out-conv-%d", now.UnixNano()), sender, "Hello! How can I help you?", raw, biz.ID, oc.ConversationID, now.Add(-10*time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+
+	// Insert automated payment receipt
+	if _, err := e.db.Exec(`INSERT INTO outbound_messages
+		(id, recipient_phone, message_type, text_content, raw_payload, status, business_id, conversation_id, created_at)
+		VALUES ($1,$2,'text',$3,$4,'sent',$5,$6,$7)`,
+		fmt.Sprintf("out-rcpt-%d", now.UnixNano()), sender, "✅ Payment of *GHS 4.00* received! We're processing your order now.", raw, biz.ID, oc.ConversationID, now.Add(-5*time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+
+	// Insert automated payment link invoice
+	if _, err := e.db.Exec(`INSERT INTO outbound_messages
+		(id, recipient_phone, message_type, text_content, raw_payload, status, business_id, conversation_id, created_at)
+		VALUES ($1,$2,'text',$3,$4,'sent',$5,$6,$7)`,
+		fmt.Sprintf("out-inv-%d", now.UnixNano()), sender, "Tap the link below to pay securely: https://pay.example.com/inv-123", raw, biz.ID, oc.ConversationID, now.Add(-4*time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+
+	history, err := workers.FetchConversationHistory(context.Background(), e.pool, oc.ConversationID)
+	if err != nil {
+		t.Fatalf("FetchConversationHistory: %v", err)
+	}
+
+	// Only conversational outbound should be present
+	if len(history) != 1 {
+		t.Fatalf("expected 1 history message (receipt and invoice link excluded), got %d: %+v", len(history), history)
+	}
+	if history[0].Parts[0].Text != "Hello! How can I help you?" {
+		t.Errorf("history[0] = %q, want 'Hello! How can I help you?'", history[0].Parts[0].Text)
+	}
+}

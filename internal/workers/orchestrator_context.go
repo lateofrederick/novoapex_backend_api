@@ -166,6 +166,7 @@ type outboundRow struct {
 // rule keys off the NEWEST inbound row of the conversation. Blocked sends
 // still persist a failed_24h_window_closed row with rawPayload {}.
 func orchEnqueueOutboundText(ctx context.Context, deps OrchestratorDeps, businessID, conversationID, textContent string) error {
+	textContent = stripInternalProductIDs(textContent)
 	outID := uuid.NewString()
 	within, err := orchWithin24hWindow(ctx, deps.Pool, conversationID)
 	if err != nil {

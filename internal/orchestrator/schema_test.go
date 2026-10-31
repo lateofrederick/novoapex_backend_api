@@ -21,7 +21,7 @@ const (
 	descDetectedPreferences     = "Product categories or attributes the customer shows interest in (e.g. \"organic\", \"large size\", \"spicy\", \"hair products\"). Empty array if none detected in this turn."
 	descSentiment               = "Overall customer sentiment in this message turn. Complaints/frustration → negative, thanks/praise → positive, neutral otherwise."
 	descCrmRoot                 = "Lightweight CRM signals. Only populate fields that are EXPLICITLY present in the current message turn. Do not guess or infer. When in doubt, leave fields as null/empty — false negatives are better than false positives for CRM data."
-	descReplyText               = "The precise text response to send back to the user via WhatsApp."
+	descReplyText               = "The precise text response to send back to the user via WhatsApp. Do NOT include internal product IDs (e.g. [ID: xxx]) in this text; product IDs are internal only."
 	descInternalConfidence      = "Confidence score from 0.0 to 1.0 that this response is safe, accurate, and perfectly addresses the user intent without hallucinations."
 	descIntent                  = "The extracted intent of the user's message. Use 'image_match' when the customer sent an image that visually matched a product in the catalog."
 	descCustomerRequestedImages = "True ONLY if the customer explicitly asked to see a photo/picture/image in THIS message turn — including \"yes\"/\"sure\" in direct reply to your offer to send photos, or sending their own photo asking which product it is. False for every other turn, including when they merely mention or order a product."

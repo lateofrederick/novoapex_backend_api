@@ -138,7 +138,7 @@ func LLMSchemaJSON() []byte {
   "properties": {
     "reply_text": {
       "type": "string",
-      "description": "The precise text response to send back to the user via WhatsApp."
+      "description": "The precise text response to send back to the user via WhatsApp. Do NOT include internal product IDs (e.g. [ID: xxx]) in this text; product IDs are internal only."
     },
     "internal_confidence": {
       "type": "number",

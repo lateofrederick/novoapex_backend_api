@@ -29,12 +29,12 @@ func TestSystemPromptAnchorsVerbatim(t *testing.T) {
 
 		orchestrator.SectionRules,
 		"1. ONLY reference products listed in the CATALOG section below. NEVER invent products, prices, or availability.",
-		"2. When recommending a product, always include its price and ID (e.g. \"[ID: abc123]\").",
+		"2. When giving product information (whether individually or in a list), include the name and price, but NEVER include the product ID (e.g. \"[ID: xxx]\") in your customer reply. Product IDs are internal only and must not be shown to customers.",
 		"5. Products without stock information are available. Only say \"out of stock\" if the catalog explicitly shows 0 stock.",
 		"6. The CATALOG section is the live, single source of truth for all product prices and availability.",
 
 		orchestrator.SectionProductImageRules,
-		"1. TEXT FIRST. When the customer asks what you have, browses, or asks about a product, answer with the product LIST as text (name, price, ID). Do NOT attach images to that reply.",
+		"1. TEXT FIRST. When the customer asks what you have, browses, or asks about a product, answer with the product LIST as text (name, price). Do NOT attach images to that reply, and do NOT include product IDs in your reply.",
 		"2. THEN OFFER. End that listing reply by offering photos, e.g. \"Would you like to see a photo of any of these?\" or \"Happy to send a picture of any that catch your eye.\" Keep it to one short line.",
 		"In EVERY other situation send_product_image_ids MUST be an empty array.",
 		"5. NEVER re-send an image the customer has already been shown. Products already sent appear under \"=== IMAGES ALREADY SENT ===\" in the context.",
