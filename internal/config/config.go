@@ -43,6 +43,7 @@ type Config struct {
 
 	GoogleGenerativeAIAPIKey string
 	OpenAIAPIKey             string
+	OpenAIModel              string
 
 	PaystackSecretKey string
 	PaystackPublicKey string
@@ -153,6 +154,10 @@ func load(lookup envFunc) (*Config, error) {
 
 	c.GoogleGenerativeAIAPIKey = optionalString(lookup, "GOOGLE_GENERATIVE_AI_API_KEY")
 	c.OpenAIAPIKey = optionalString(lookup, "OPENAI_API_KEY")
+	c.OpenAIModel = stringWithDefault(lookup, "OPENAI_MODEL", "gpt-4o-mini", fail)
+	if c.OpenAIModel == "" {
+		c.OpenAIModel = "gpt-4o-mini"
+	}
 
 	c.PaystackSecretKey = optionalString(lookup, "PAYSTACK_SECRET_KEY")
 	c.PaystackPublicKey = optionalString(lookup, "PAYSTACK_PUBLIC_KEY")

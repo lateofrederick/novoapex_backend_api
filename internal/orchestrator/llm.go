@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"os"
 	"strings"
 	"sync"
 
@@ -48,6 +49,9 @@ type ResponsesLLM struct {
 // NewResponsesLLM builds an engine on top of the shared openai transport.
 func NewResponsesLLM(cfg LLMConfig) *ResponsesLLM {
 	model := cfg.Model
+	if model == "" {
+		model = os.Getenv("OPENAI_MODEL")
+	}
 	if model == "" {
 		model = DefaultLLMModel
 	}

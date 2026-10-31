@@ -71,6 +71,18 @@ func TestDefaultsMatchNodeSchema(t *testing.T) {
 	if c.ReengagementCooldownDays != 30 {
 		t.Errorf("CooldownDays = %d", c.ReengagementCooldownDays)
 	}
+	if c.OpenAIModel != "gpt-4o-mini" {
+		t.Errorf("OpenAIModel = %q, want gpt-4o-mini", c.OpenAIModel)
+	}
+}
+
+func TestOpenAIModelOverride(t *testing.T) {
+	env := baseEnv()
+	env["OPENAI_MODEL"] = "gpt-4o"
+	c := mustLoad(t, env)
+	if c.OpenAIModel != "gpt-4o" {
+		t.Errorf("OpenAIModel = %q, want gpt-4o", c.OpenAIModel)
+	}
 }
 
 func TestRequiredVarsMissing(t *testing.T) {

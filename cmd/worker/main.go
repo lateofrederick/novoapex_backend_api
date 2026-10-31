@@ -112,7 +112,11 @@ func main() {
 	workers.RegisterOrchestrator(server, workers.OrchestratorDeps{
 		Pool:      pool,
 		Publisher: client,
-		LLM:       orchestrator.NewResponsesLLM(orchestrator.LLMConfig{APIKey: cfg.OpenAIAPIKey, BaseURL: openaiBaseURL}),
+		LLM: orchestrator.NewResponsesLLM(orchestrator.LLMConfig{
+			APIKey:  cfg.OpenAIAPIKey,
+			BaseURL: openaiBaseURL,
+			Model:   cfg.OpenAIModel,
+		}),
 		Catalog: orchestrator.CatalogAdapter(orchestrator.RetrieverDeps{Pool: pool, OpenAI: openaiClient}, func(ctx context.Context, image []byte, mimeType string) ([]float32, error) {
 			return gemini.EmbedContent(ctx, workers.ImageEmbeddingModel, workers.ImageEmbeddingDimensions, []google.Part{{InlineData: &google.InlineData{MimeType: mimeType, Data: base64.StdEncoding.EncodeToString(image)}}})
 		}),

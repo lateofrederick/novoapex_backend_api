@@ -372,3 +372,37 @@ func TestGenerateObjectTransportErrorFailsFast(t *testing.T) {
 		t.Errorf("calls = %d, want 1 (no malformed-retry on transport errors)", stub.calls())
 	}
 }
+
+func TestResponsesLLM_ModelEnvAndConfigOverride(t *testing.T) {
+	stub := &responsesStub{replies: []string{validLlmJSON, validLlmJSON}}
+	server := httptest.NewServer(http.HandlerFunc(stub.handler))
+	defer server.Close()
+
+	// 1. Model configured explicitly via LLMConfig
+	llmExplicit := orchestrator.NewResponsesLLM(orchestrator.LLMConfig{
+		APIKey:     "test-key",
+		BaseURL:    server.URL,
+		Model:      "gpt-4o",
+		HTTPClient: server.Client(),
+	})
+	if _, err := llmExplicit.GenerateObject(context.Background(), wantGenerateRequest()); err != nil {
+		t.Fatalf("GenerateObject explicit: %v", err)
+	}
+	if stub.bodies[0]["model"] != "gpt-4o" {
+		t.Errorf("model = %v, want gpt-4o", stub.bodies[0]["model"])
+	}
+
+	// 2. Model configured via OPENAI_MODEL environment variable
+	t.Setenv("OPENAI_MODEL", "gpt-4o-2024-08-06")
+	llmEnv := orchestrator.NewResponsesLLM(orchestrator.LLMConfig{
+		APIKey:     "test-key",
+		BaseURL:    server.URL,
+		HTTPClient: server.Client(),
+	})
+	if _, err := llmEnv.GenerateObject(context.Background(), wantGenerateRequest()); err != nil {
+		t.Fatalf("GenerateObject env: %v", err)
+	}
+	if stub.bodies[1]["model"] != "gpt-4o-2024-08-06" {
+		t.Errorf("model = %v, want gpt-4o-2024-08-06", stub.bodies[1]["model"])
+	}
+}
